@@ -695,6 +695,24 @@ func derivePairingParams(code: String) -> (pairingId: String, w: BigUInt256) {
     return (pairingId, w)
 }
 
+/// Derive pairing parameters for both the current and previous time windows
+func derivePairingParamsBothWindows(code: String) -> (current: (pairingId: String, w: BigUInt256), previous: (pairingId: String, w: BigUInt256)) {
+    let window = Int(Date().timeIntervalSince1970) / 600
+    let salt1 = "latch-relay-room-v1\(window)".data(using: .utf8)!
+    let seed1 = pbkdf2SHA256(password: code.uppercased(), salt: salt1, iterations: 100_000, keyLength: 32)
+    let pid1 = hkdfExpandSHA256(prk: seed1, info: "roomId".data(using: .utf8)!, length: 32).map { String(format: "%02x", $0) }.joined()
+    let w1Bytes = hkdfExpandSHA256(prk: seed1, info: "spake2-w".data(using: .utf8)!, length: 48)
+    let w1 = ModP256.reduceModN(data: w1Bytes)
+
+    let salt2 = "latch-relay-room-v1\(window - 1)".data(using: .utf8)!
+    let seed2 = pbkdf2SHA256(password: code.uppercased(), salt: salt2, iterations: 100_000, keyLength: 32)
+    let pid2 = hkdfExpandSHA256(prk: seed2, info: "roomId".data(using: .utf8)!, length: 32).map { String(format: "%02x", $0) }.joined()
+    let w2Bytes = hkdfExpandSHA256(prk: seed2, info: "spake2-w".data(using: .utf8)!, length: 48)
+    let w2 = ModP256.reduceModN(data: w2Bytes)
+
+    return (current: (pid1, w1), previous: (pid2, w2))
+}
+
 /// SPAKE2 start: generates scalar, computes pubShare = scalar*G + w*M
 /// Both peers blind with M (pubShare is sent before role assignment).
 func spake2Start(w: BigUInt256) -> (scalar: BigUInt256, pubShare: Data) {

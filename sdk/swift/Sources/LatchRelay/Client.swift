@@ -101,10 +101,16 @@ public class LatchClient {
     /// Returns the channel state after successful SPAKE2 key agreement and channel establishment.
     public func pair(code: String) async throws -> ChannelState {
         guard webSocket != nil else { throw LatchRelayError.connectionClosed }
+        let (current, previous) = derivePairingParamsBothWindows(code: code)
+        do {
+            return try await pairWithParams(pairingId: current.pairingId, w: current.w)
+        } catch LatchRelayError.timeout {
+            return try await pairWithParams(pairingId: previous.pairingId, w: previous.w)
+        }
+    }
 
-        // Derive pairing parameters
-        let (pairingId, w) = derivePairingParams(code: code)
-
+    /// Internal pairing implementation using specific pairing parameters.
+    private func pairWithParams(pairingId: String, w: BigUInt256) async throws -> ChannelState {
         // Start SPAKE2 (both peers blind with M, role assigned later)
         let (scalar, pubShare) = spake2Start(w: w)
 
@@ -152,7 +158,7 @@ public class LatchClient {
         }
 
         // Join the channel
-        let joinMsg = InMsg(type: "join", ch: channelId, id: id, role: role)
+        let joinMsg = InMsg(type: "join", ch: channelId, id: id)
         try await sendJSON(joinMsg)
 
         // Wait for challenge
@@ -203,7 +209,7 @@ public class LatchClient {
 
         // Compute and send MAC for the first challenge
         let mac = computeChallengeMAC(encKey: encKey, channelId: channelId, nonce: nonce, id: id, role: role)
-        let responseMsg = InMsg(type: "response", ch: channelId, mac: base64urlEncode(mac), role: role)
+        let responseMsg = InMsg(type: "response", ch: channelId, mac: base64urlEncode(mac))
         try await sendJSON(responseMsg)
 
         // Wait for either verify_peer or re-challenge
@@ -231,6 +237,13 @@ public class LatchClient {
 
         let actualPeerId = verify.peerId ?? peerId
         let peerRole = verify.peerRole ?? (role == "initiator" ? "responder" : "initiator")
+
+        // Reject if peer has the same ID as us (self-pairing)
+        if actualPeerId == id {
+            let rejectMsg = InMsg(type: "error", ch: channelId, code: "verify_rejected")
+            try await sendJSON(rejectMsg)
+            throw LatchRelayError.verifyRejected
+        }
 
         let valid = verifyChallengeMAC(
             encKey: encKey, channelId: channelId,
@@ -408,7 +421,7 @@ public class LatchClient {
             encKey: channel.encKey, channelId: ch,
             nonce: nonce, id: id, role: channel.role
         )
-        let responseMsg = InMsg(type: "response", ch: ch, mac: base64urlEncode(mac), role: channel.role)
+        let responseMsg = InMsg(type: "response", ch: ch, mac: base64urlEncode(mac))
 
         Task {
             try? await sendJSON(responseMsg)
