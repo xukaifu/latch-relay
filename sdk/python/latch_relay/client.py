@@ -150,7 +150,6 @@ class LatchClient:
             "type": "join",
             "ch": channel_id,
             "id": self.peer_id,
-            "role": role,
         })
 
         verify_msg = None
@@ -189,7 +188,6 @@ class LatchClient:
                     "type": "response",
                     "ch": channel_id,
                     "mac": _b64url_encode(mac),
-                    "role": role,
                 })
             elif result["type"] == "verify_peer":
                 verify_msg = result
@@ -197,7 +195,12 @@ class LatchClient:
         peer_nonce = _b64url_decode(verify_msg["peerNonce"])
         peer_mac = _b64url_decode(verify_msg["peerMac"])
         verified_peer_id = verify_msg["peerId"]
-        peer_role = verify_msg["peerRole"]
+        expected_peer_role = "responder" if role == "initiator" else "initiator"
+        peer_role = verify_msg.get("peerRole", expected_peer_role)
+
+        if verified_peer_id == self.peer_id:
+            await self._send({"type": "error", "code": "verify_rejected", "ch": channel_id})
+            raise RuntimeError("verify_peer contains own ID (possible reflection attack)")
 
         # Verify peer's MAC
         if not crypto.verify_mac(enc_key, channel_id, peer_nonce, verified_peer_id, peer_role, peer_mac):
@@ -225,8 +228,76 @@ class LatchClient:
         (current_id, current_w), (prev_id, prev_w) = crypto.derive_pairing_both_windows(code)
         try:
             return await self._pair_with_params(current_id, current_w)
-        except Exception:
+        except asyncio.TimeoutError:
             return await self._pair_with_params(prev_id, prev_w)
+
+    async def rejoin(self, channel_id: str, enc_key: bytes, role: str) -> ChannelState:
+        """Rejoin an existing channel after reconnection."""
+        await self._send({
+            "type": "join",
+            "ch": channel_id,
+            "id": self.peer_id,
+        })
+
+        verify_msg = None
+        deadline = asyncio.get_event_loop().time() + 30.0
+        while verify_msg is None:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("Timed out waiting for verify_peer")
+
+            challenge_fut = self._wait_for("challenge", channel_id)
+            verify_fut = self._wait_for("verify_peer", channel_id)
+
+            done, pending = await asyncio.wait(
+                [asyncio.ensure_future(challenge_fut), asyncio.ensure_future(verify_fut)],
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for fut in pending:
+                fut.cancel()
+                for wkey, wlist in list(self._waiters.items()):
+                    if fut in wlist:
+                        wlist.remove(fut)
+
+            if not done:
+                raise asyncio.TimeoutError("Timed out waiting for challenge/verify_peer")
+
+            result = done.pop().result()
+            if result["type"] == "challenge":
+                nonce = _b64url_decode(result["nonce"])
+                mac = crypto.compute_mac(enc_key, channel_id, nonce, self.peer_id, role)
+                await self._send({
+                    "type": "response",
+                    "ch": channel_id,
+                    "mac": _b64url_encode(mac),
+                })
+            elif result["type"] == "verify_peer":
+                verify_msg = result
+
+        peer_nonce = _b64url_decode(verify_msg["peerNonce"])
+        peer_mac = _b64url_decode(verify_msg["peerMac"])
+        verified_peer_id = verify_msg["peerId"]
+        expected_peer_role = "responder" if role == "initiator" else "initiator"
+        peer_role = verify_msg.get("peerRole", expected_peer_role)
+
+        if verified_peer_id == self.peer_id:
+            await self._send({"type": "error", "code": "verify_rejected", "ch": channel_id})
+            raise RuntimeError("verify_peer contains own ID (possible reflection attack)")
+
+        if not crypto.verify_mac(enc_key, channel_id, peer_nonce, verified_peer_id, peer_role, peer_mac):
+            await self._send({"type": "error", "code": "verify_rejected", "ch": channel_id})
+            raise RuntimeError("Peer MAC verification failed")
+
+        channel_state = ChannelState(
+            channel_id=channel_id,
+            enc_key=enc_key,
+            role=role,
+            peer_id=verified_peer_id,
+        )
+        self._channels[channel_id] = channel_state
+        return channel_state
 
     async def send(self, channel_id: str, data: bytes):
         """Send an encrypted message on the channel."""
