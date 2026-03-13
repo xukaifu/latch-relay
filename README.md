@@ -91,11 +91,12 @@ CLI                          Bridge                         App
  |                             |                              |
  | SPAKE2 key agreement (RFC 9382, P-256):                     |
  |   w  = OS2IP(HKDF-Expand(seed, "spake2-w", 48)) mod n      |
- |   Initiator: pA = w*M + g^x    (random scalar x)           |
- |   Responder: pB = w*N + g^y    (random scalar y)            |
- |   Both compute shared secret K from unblinded DH             |
+ |   Both peers: pubShare = w*M + g^scalar  (random scalar)    |
+ |   Note: Both peers blind with M (symmetric variant).        |
+ |   Role is unknown at pubShare time; assigned by Bridge.     |
+ |   Role differentiation is in the TT transcript, not M/N.   |
+ |   Both compute K = scalar * (peerShare - w*M)               |
  |   Ke = Hash(TT)  where TT = transcript per RFC 9382         |
- |   TT identity: idProver = initiator id, idVerifier = resp id|
  |   ISK = HKDF-Extract(salt="latch-relay-isk"||pairingId, ikm=Ke)
  |                             |                              |
  | channelId = HKDF-Expand(ISK, "channel", 32)                |
@@ -359,7 +360,6 @@ Bridge is fire-and-forget: messages are forwarded only if the target peer is con
 | Code | Phase | Direction | Description |
 |------|-------|-----------|-------------|
 | `invalid_message` | Both | B→C | Malformed JSON or missing required fields |
-| `pairing_full` | Pair | B→C | A waiting peer already exists for this pairingId |
 | `pairing_expired` | Pair | B→C | No matching peer joined within PairingTTL |
 | `channel_full` | Relay | B→C | Channel already has 2 peers |
 | `channel_not_found` | Relay | B→C | Channel does not exist |
@@ -417,6 +417,8 @@ Plain X25519 + verify is vulnerable to MITM brute-force: a malicious Bridge coul
 SPAKE2 eliminates this attack class entirely. The password (pairing code) is embedded into the key exchange via blinding with constant points M and N (defined in RFC 9382). Without knowing the code, an attacker cannot unblind the exchanged values and computes a completely different shared key.
 
 SPAKE2 over P-256 is chosen for portability: P-256 is natively supported by virtually all cryptographic libraries and hardware security modules, including IoT platforms (ESP32 mbedtls, STM32 CryptoLib), mobile (CryptoKit, BouncyCastle), and browsers (Web Crypto API).
+
+**Note:** The implementation uses a symmetric SPAKE2 variant where both peers blind with M (not M/N as in RFC 9382). This is because the pubShare must be sent before the server assigns roles. Role differentiation is achieved through the TT transcript (idProver/idVerifier ordering) rather than distinct blinding points. This avoids an extra round-trip for role assignment, which is significant for IoT devices where PBKDF2 + SPAKE2 already takes 10+ seconds.
 
 ### Why PBKDF2 for pairingId
 
