@@ -1,0 +1,31 @@
+# Binaries
+latch-relay
+latch-e2e
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Node.js
+node_modules/
+
+# Swift
+.build/
+.swiftpm/
+
+# Environment / IDE
+.env
+.DS_Store
+
+# Claude Code
+CLAUDE.md
+docs/superpowers/
+.claude/
