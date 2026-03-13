@@ -2,9 +2,99 @@
 
 General-purpose zero-knowledge WebSocket relay. Pure in-memory, no persistence — only does pairing matchmaking and encrypted message forwarding.
 
+---
+
+## Quick Start
+
+### Server
+
 ```bash
-PORT=8081 go run .
+# From source
+cd server && go run .
+
+# Or install the binary
+go install github.com/xukaifu/latch-relay/server@latest
+latch-relay
+
+# Or Docker
+docker build -t latch-relay .
+docker run -p 8081:8081 latch-relay
 ```
+
+Environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8081` | Listen port |
+| `MAX_CHANNELS` | `10000` | Global channel cap |
+| `MAX_PAIRINGS_PER_IP` | `5` | Max concurrent pairings per IP |
+| `MAX_CHANNELS_PER_IP` | `20` | Max channels per IP |
+
+Pre-built binaries for Linux/macOS/Windows (amd64/arm64) are available on [GitHub Releases](https://github.com/xukaifu/latch-relay/releases).
+
+### SDKs
+
+**Go**
+```bash
+go get github.com/xukaifu/latch-relay/sdk/go@latest
+```
+
+```go
+import latchrelay "github.com/xukaifu/latch-relay/sdk/go"
+
+client, _ := latchrelay.NewClient("ws://localhost:8081/v1/connect", "my-peer-id")
+ch, _ := client.Pair("ABCD-EFGH")
+client.Send(ch.ChannelID, []byte("hello"))
+```
+
+**Node.js**
+```bash
+npm install latch-relay-sdk
+```
+
+```typescript
+import { LatchClient } from 'latch-relay-sdk';
+
+const client = new LatchClient('ws://localhost:8081/v1/connect', 'my-peer-id');
+await client.connect();
+const ch = await client.pair('ABCD-EFGH');
+await client.send(ch.channelId, Buffer.from('hello'));
+```
+
+**Python**
+```bash
+pip install latch-relay-sdk
+```
+
+```python
+from latch_relay import LatchClient
+
+client = LatchClient("ws://localhost:8081/v1/connect", "my-peer-id")
+await client.connect()
+ch = await client.pair("ABCD-EFGH")
+await client.send(ch.channel_id, b"hello")
+```
+
+**Swift**
+
+Add to `Package.swift`:
+```swift
+dependencies: [
+    .package(url: "https://github.com/xukaifu/latch-relay.git", from: "0.1.0")
+]
+// target dependency: .product(name: "LatchRelay", package: "latch-relay")
+```
+
+```swift
+import LatchRelay
+
+let client = LatchClient(serverURL: URL(string: "ws://localhost:8081")!, id: "my-peer-id")
+try await client.connect()
+let ch = try await client.pair(code: "ABCD-EFGH")
+try await client.send(channelId: ch.channelId, data: "hello".data(using: .utf8)!)
+```
+
+> **Note:** Go SDK and Swift SDK are available now via Go Modules and Swift Package Manager (pulled directly from GitHub). Node.js and Python SDKs will be published to npm and PyPI respectively — until then, install from source.
 
 ---
 

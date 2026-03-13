@@ -1,0 +1,21 @@
+version: 2
+
+builds:
+  - dir: server
+    binary: latch-relay
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+
+changelog:
+  sort: asc
