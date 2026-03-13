@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@noble/curves": "^1.4.0",
-    "@noble/hashes": "^1.4.0",
     "ws": "^8.16.0"
   },
   "devDependencies": {

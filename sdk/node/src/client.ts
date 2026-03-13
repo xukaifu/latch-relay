@@ -180,7 +180,6 @@ export class LatchClient {
             type: 'join',
             ch: channelId,
             id: this.id,
-            role: myRole,
         });
 
         // Challenge-response loop: handle re-challenges until verify_peer
@@ -208,7 +207,6 @@ export class LatchClient {
                 type: 'response',
                 ch: channelId,
                 mac: mac.toString('base64url'),
-                role: myRole,
             });
         }
 
@@ -218,6 +216,11 @@ export class LatchClient {
         const peerIdFromVerify = verify.peerId ?? peerId;
         const peerRole = verify.peerRole ?? (myRole === 'initiator' ? 'responder' : 'initiator');
         const expectedMac = computeChallengeMac(encKey, channelId, peerNonce, peerIdFromVerify, peerRole);
+
+        if (peerIdFromVerify === this.id) {
+            this.sendRaw({ type: 'error', code: 'verify_rejected', ch: channelId });
+            throw new Error('Peer verification failed: peerId equals own id (possible reflection)');
+        }
 
         if (!crypto.timingSafeEqual(peerMac, expectedMac)) {
             this.sendRaw({ type: 'error', code: 'verify_rejected', ch: channelId });
