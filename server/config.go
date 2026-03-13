@@ -14,6 +14,8 @@ type Config struct {
 	IdleTimeout      time.Duration
 	ChallengeTimeout time.Duration
 	WaitPeerTimeout  time.Duration
+	MaxPairingsPerIP int
+	MaxChannelsPerIP int
 }
 
 func LoadConfig() Config {
@@ -31,6 +33,12 @@ func LoadConfig() Config {
 	}
 	if n, err := strconv.Atoi(os.Getenv("MAX_CHANNELS")); err == nil && n > 0 {
 		c.MaxChannelsTotal = n
+	}
+	if n, err := strconv.Atoi(os.Getenv("MAX_PAIRINGS_PER_IP")); err == nil && n > 0 {
+		c.MaxPairingsPerIP = n
+	}
+	if n, err := strconv.Atoi(os.Getenv("MAX_CHANNELS_PER_IP")); err == nil && n > 0 {
+		c.MaxChannelsPerIP = n
 	}
 	return c
 }

@@ -16,6 +16,8 @@ func main() {
 		IdleTimeout:      cfg.IdleTimeout,
 		ChallengeTimeout: cfg.ChallengeTimeout,
 		WaitPeerTimeout:  cfg.WaitPeerTimeout,
+		MaxPairingsPerIP: cfg.MaxPairingsPerIP,
+		MaxChannelsPerIP: cfg.MaxChannelsPerIP,
 	})
 
 	mux := http.NewServeMux()

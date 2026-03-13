@@ -93,7 +93,11 @@ func startServer(t *testing.T, port int) (cancel func()) {
 
 	ctx, cancelFn := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, serverBin)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("PORT=%d", port),
+		"MAX_PAIRINGS_PER_IP=100",
+		"MAX_CHANNELS_PER_IP=100",
+	)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

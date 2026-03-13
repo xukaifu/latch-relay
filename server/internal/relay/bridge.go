@@ -23,12 +23,14 @@ const (
 
 // BridgeConfig holds all configurable parameters.
 type BridgeConfig struct {
-	MaxChannelsTotal int
-	MaxMessageSize   int64
-	PairingTTL       time.Duration
-	IdleTimeout      time.Duration
-	ChallengeTimeout time.Duration
-	WaitPeerTimeout  time.Duration
+	MaxChannelsTotal  int
+	MaxMessageSize    int64
+	PairingTTL        time.Duration
+	IdleTimeout       time.Duration
+	ChallengeTimeout  time.Duration
+	WaitPeerTimeout   time.Duration
+	MaxPairingsPerIP  int // 0 = default (5)
+	MaxChannelsPerIP  int // 0 = default (20)
 }
 
 // Bridge is the central relay server state.
@@ -47,6 +49,14 @@ type Bridge struct {
 
 // NewBridge creates a new Bridge instance.
 func NewBridge(cfg BridgeConfig) *Bridge {
+	pairLimit := cfg.MaxPairingsPerIP
+	if pairLimit <= 0 {
+		pairLimit = 5
+	}
+	chanLimit := cfg.MaxChannelsPerIP
+	if chanLimit <= 0 {
+		chanLimit = 20
+	}
 	b := &Bridge{
 		waitingPeers: make(map[string]*WaitingPeer),
 		channels:     make(map[string]*Channel),
@@ -54,8 +64,8 @@ func NewBridge(cfg BridgeConfig) *Bridge {
 		cfg:          cfg,
 		connRate:     NewRateLimiter(10, time.Second),
 		joinRate:     NewRateLimiter(3, 10*time.Second),
-		pairRate:     NewRateLimiter(5, 10*time.Minute),
-		channelRate:  NewRateLimiter(20, 10*time.Minute),
+		pairRate:     NewRateLimiter(pairLimit, 10*time.Minute),
+		channelRate:  NewRateLimiter(chanLimit, 10*time.Minute),
 		stop:         make(chan struct{}),
 	}
 	go b.cleanupLoop()
