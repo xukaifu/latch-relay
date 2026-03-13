@@ -56,9 +56,10 @@ type ChannelMember struct {
 
 // Channel represents a 1:1 relay conduit.
 type Channel struct {
-	mu    sync.Mutex
-	State string
-	Peers [2]*ChannelMember
+	mu      sync.Mutex
+	State   string
+	WaitGen uint64 // incremented each time State enters WAIT_PEER
+	Peers   [2]*ChannelMember
 }
 
 // InMsg is an incoming message from a client.

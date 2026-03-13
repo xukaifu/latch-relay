@@ -854,6 +854,59 @@ func TestMaxChannelsPerIPRateLimit(t *testing.T) {
 	}
 }
 
+func TestWaitPeerTimeoutStaleGoroutine(t *testing.T) {
+	b := NewBridge(BridgeConfig{
+		MaxChannelsTotal: 100,
+		MaxMessageSize:   256 * 1024,
+		PairingTTL:       10 * time.Minute,
+		IdleTimeout:      60 * time.Second,
+		ChallengeTimeout: 10 * time.Second,
+		WaitPeerTimeout:  300 * time.Millisecond, // short for testing
+	})
+	t.Cleanup(b.Close)
+	s := testServer(b)
+	defer s.Close()
+
+	ws1 := dial(t, s)
+	defer ws1.Close(websocket.StatusNormalClosure, "")
+	ws2 := dial(t, s)
+	defer ws2.Close(websocket.StatusNormalClosure, "")
+
+	// Peer A joins → WAIT_PEER (starts timeout goroutine #1 with gen=1)
+	send(t, ws1, InMsg{Type: "join", Ch: "ch1", ID: "peer-A"})
+	recv(t, ws1) // challenge
+
+	// Peer B joins → CHALLENGING → respond → ACTIVE (before 300ms)
+	send(t, ws2, InMsg{Type: "join", Ch: "ch1", ID: "peer-B"})
+	recv(t, ws1) // re-challenge
+	recv(t, ws2) // challenge
+	send(t, ws1, InMsg{Type: "response", Ch: "ch1", Mac: b64.EncodeToString([]byte("mac-A"))})
+	send(t, ws2, InMsg{Type: "response", Ch: "ch1", Mac: b64.EncodeToString([]byte("mac-B"))})
+	recv(t, ws1) // verify_peer
+	recv(t, ws2) // verify_peer
+	// Now ACTIVE
+
+	// Peer A leaves → WAIT_PEER (starts timeout goroutine #2 with gen=2)
+	// Record time so we know when goroutine #2 will fire
+	send(t, ws1, InMsg{Type: "leave", Ch: "ch1"})
+	recv(t, ws2) // peer_left
+
+	// Wait for goroutine #1's timeout to fire (300ms from test start)
+	// but NOT long enough for goroutine #2 (300ms from leave) to fire.
+	// The join-challenge-response-leave sequence takes ~50ms, so goroutine #1
+	// fires at ~300ms and goroutine #2 fires at ~350ms. Sleep 200ms after
+	// the leave to land between them — goroutine #1 has fired, #2 has not.
+	time.Sleep(250 * time.Millisecond)
+
+	// Channel should still exist (goroutine #1 had gen=1, current gen=2)
+	b.mu.Lock()
+	_, exists := b.channels["ch1"]
+	b.mu.Unlock()
+	if !exists {
+		t.Fatal("channel should still exist — stale goroutine #1 should not delete it")
+	}
+}
+
 // setupActiveChannel sets up a fully active channel between two websockets.
 func setupActiveChannel(t *testing.T, ws1, ws2 *websocket.Conn, chID, id1, id2 string) {
 	t.Helper()

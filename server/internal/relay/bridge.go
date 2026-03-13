@@ -330,8 +330,10 @@ func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
 
 	if peerCount == 0 {
 		ch.State = StateWaitPeer
+		ch.WaitGen++
+		gen := ch.WaitGen
 		sendMsg(conn, OutMsg{Type: "challenge", Ch: msg.Ch, Nonce: b64.EncodeToString(nonce)})
-		go b.waitPeerTimeout(msg.Ch)
+		go b.waitPeerTimeout(msg.Ch, gen)
 	} else {
 		// Second peer: re-challenge BOTH with fresh nonces
 		ch.State = StateChallenging
@@ -579,12 +581,14 @@ func (b *Bridge) removePeerFromChannelLocked(ch *Channel, chID string, conn *Con
 
 	// Other peer remains: transition to WAIT_PEER, clear challenge data
 	ch.State = StateWaitPeer
+	ch.WaitGen++
+	gen := ch.WaitGen
 	remaining.Nonce = nil
 	remaining.Response = nil
 
 	sendMsg(remaining.Conn, OutMsg{Type: "peer_left", Ch: chID, PeerID: removedID})
 
-	go b.waitPeerTimeout(chID)
+	go b.waitPeerTimeout(chID, gen)
 }
 
 func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
@@ -628,7 +632,7 @@ func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
 	}
 }
 
-func (b *Bridge) waitPeerTimeout(chID string) {
+func (b *Bridge) waitPeerTimeout(chID string, gen uint64) {
 	time.Sleep(b.cfg.WaitPeerTimeout)
 
 	b.mu.Lock()
@@ -641,8 +645,8 @@ func (b *Bridge) waitPeerTimeout(chID string) {
 	b.mu.Unlock()
 	defer ch.mu.Unlock()
 
-	if ch.State != StateWaitPeer {
-		return
+	if ch.State != StateWaitPeer || ch.WaitGen != gen {
+		return // stale timeout
 	}
 
 	for i, peer := range ch.Peers {
