@@ -16,6 +16,7 @@ type Config struct {
 	WaitPeerTimeout  time.Duration
 	MaxPairingsPerIP int
 	MaxChannelsPerIP int
+	TrustProxy       bool
 }
 
 func LoadConfig() Config {
@@ -39,6 +40,9 @@ func LoadConfig() Config {
 	}
 	if n, err := strconv.Atoi(os.Getenv("MAX_CHANNELS_PER_IP")); err == nil && n > 0 {
 		c.MaxChannelsPerIP = n
+	}
+	if os.Getenv("TRUST_PROXY") == "true" || os.Getenv("TRUST_PROXY") == "1" {
+		c.TrustProxy = true
 	}
 	return c
 }

@@ -323,6 +323,7 @@ func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
 		log.Printf("failed to generate nonce: %v", err)
+		sendMsg(conn, OutMsg{Type: "error", Code: ErrInternal, Ch: msg.Ch, Message: "internal error"})
 		return
 	}
 
@@ -353,6 +354,15 @@ func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
 				freshNonce := make([]byte, 32)
 				if _, err := rand.Read(freshNonce); err != nil {
 					log.Printf("failed to generate nonce: %v", err)
+					sendMsg(conn, OutMsg{Type: "error", Code: ErrInternal, Ch: msg.Ch, Message: "internal error"})
+					// Remove the newly added peer and restore channel to WaitPeer
+					ch.Peers[slot] = nil
+					conn.mu.Lock()
+					delete(conn.Channels, msg.Ch)
+					conn.mu.Unlock()
+					ch.State = StateWaitPeer
+					ch.WaitGen++
+					go b.waitPeerTimeout(msg.Ch, ch.WaitGen)
 					return
 				}
 				ch.Peers[i].Nonce = freshNonce
@@ -605,7 +615,13 @@ func (b *Bridge) removePeerFromChannelLocked(ch *Channel, chID string, conn *Con
 }
 
 func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
-	time.Sleep(b.cfg.ChallengeTimeout)
+	timer := time.NewTimer(b.cfg.ChallengeTimeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-b.stop:
+		return
+	}
 
 	b.mu.Lock()
 	ch, exists := b.channels[chID]
@@ -646,7 +662,13 @@ func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
 }
 
 func (b *Bridge) waitPeerTimeout(chID string, gen uint64) {
-	time.Sleep(b.cfg.WaitPeerTimeout)
+	timer := time.NewTimer(b.cfg.WaitPeerTimeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-b.stop:
+		return
+	}
 
 	b.mu.Lock()
 	ch, exists := b.channels[chID]

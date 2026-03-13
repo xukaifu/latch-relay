@@ -1,18 +1,18 @@
-import crypto from 'node:crypto';
-import WebSocket from 'ws';
 import {
-    derivePairingParams,
     derivePairingParamsBothWindows,
     spake2Start,
     spake2Finish,
     computeChallengeMac,
     encrypt,
     decrypt,
+    toBase64url,
+    fromBase64url,
+    timingSafeEqual,
 } from './crypto.js';
 
 export interface ChannelState {
     channelId: string;
-    encKey: Buffer;
+    encKey: Uint8Array;
     role: 'initiator' | 'responder';
     peerId: string;
     active: boolean;
@@ -44,7 +44,7 @@ export class LatchClient {
     private waiters = new Map<string, Resolver[]>();
     private globalWaiters: Resolver[] = [];
 
-    onMessage?: (channelId: string, peerId: string, data: Buffer) => void;
+    onMessage?: (channelId: string, peerId: string, data: Uint8Array) => void;
 
     constructor(serverUrl: string, id: string) {
         this.serverUrl = serverUrl;
@@ -54,29 +54,29 @@ export class LatchClient {
     async connect(): Promise<void> {
         return new Promise((resolve, reject) => {
             this.ws = new WebSocket(this.serverUrl);
-            this.ws.on('open', () => resolve());
-            this.ws.on('error', (err) => reject(err));
-            this.ws.on('message', (raw) => {
+            this.ws.onopen = () => resolve();
+            this.ws.onerror = () => reject(new Error('WebSocket connection failed'));
+            this.ws.onmessage = (event) => {
                 let msg: InMsg;
                 try {
-                    msg = JSON.parse(raw.toString());
+                    msg = JSON.parse(event.data as string);
                 } catch {
                     console.error('latch-relay: failed to parse message');
                     return;
                 }
                 this.dispatch(msg);
-            });
+            };
         });
     }
 
-    private dispatch(msg: InMsg): void {
+    private async dispatch(msg: InMsg): Promise<void> {
         // Handle relayed messages
         if (msg.type === 'message' && msg.ch && msg.data) {
             const ch = this.channels.get(msg.ch);
             if (ch && this.onMessage) {
-                const ciphertext = Buffer.from(msg.data, 'base64url');
+                const ciphertext = fromBase64url(msg.data);
                 try {
-                    const plaintext = decrypt(ch.encKey, ch.channelId, ciphertext);
+                    const plaintext = await decrypt(ch.encKey, ch.channelId, ciphertext);
                     this.onMessage(ch.channelId, msg.peerId ?? '', plaintext);
                 } catch {
                     // Ignore decryption failures
@@ -138,7 +138,6 @@ export class LatchClient {
                 if (resolved) return;
                 resolved = true;
                 clearTimeout(timer);
-                // Remove this resolver from all keys
                 for (const k of keys) {
                     const list = this.waiters.get(k);
                     if (list) {
@@ -152,7 +151,6 @@ export class LatchClient {
             const timer = setTimeout(() => {
                 if (resolved) return;
                 resolved = true;
-                // Clean up resolver from all keys
                 for (const k of keys) {
                     const list = this.waiters.get(k);
                     if (list) {
@@ -180,11 +178,10 @@ export class LatchClient {
     }
 
     async pair(code: string): Promise<ChannelState> {
-        const { current, previous } = derivePairingParamsBothWindows(code);
+        const { current, previous } = await derivePairingParamsBothWindows(code);
         try {
             return await this.pairWithParams(current.pairingId, current.w);
         } catch (e) {
-            // Only fall back for timeout/connection errors, not crypto/verification failures
             if (e instanceof Error && (e.message.includes('timeout') || e.message.includes('closed'))) {
                 return await this.pairWithParams(previous.pairingId, previous.w);
             }
@@ -195,88 +192,21 @@ export class LatchClient {
     private async pairWithParams(pairingId: string, w: bigint): Promise<ChannelState> {
         const state = spake2Start(w, 'initiator');
 
-        // Send pair message
         this.sendRaw({
             type: 'pair',
             ch: pairingId,
             id: this.id,
-            pubShare: Buffer.from(state.pubShare).toString('base64url'),
+            pubShare: toBase64url(state.pubShare),
         });
 
-        // Wait for pair_matched
         const matched = await this.waitFor(`pair_matched:${pairingId}`);
         const myRole = (matched.role as 'initiator' | 'responder') ?? 'initiator';
         state.role = myRole;
 
-        const peerPubShare = Buffer.from(matched.pubShare!, 'base64url');
+        const peerPubShare = fromBase64url(matched.pubShare!);
         const peerId = matched.id ?? '';
-        const { channelId, encKey } = spake2Finish(state, peerPubShare, w, pairingId, this.id, peerId);
+        const { channelId, encKey } = await spake2Finish(state, peerPubShare, w, pairingId, this.id, peerId);
 
-        // Join the channel
-        this.sendRaw({
-            type: 'join',
-            ch: channelId,
-            id: this.id,
-        });
-
-        // Challenge-response loop: handle re-challenges until verify_peer
-        let verify: InMsg | undefined;
-        const deadline = Date.now() + 30000;
-        while (!verify) {
-            const remaining = deadline - Date.now();
-            if (remaining <= 0) throw new Error('Timed out waiting for verify_peer');
-
-            // Wait for either challenge or verify_peer
-            const msg = await this.waitForAny(
-                [`challenge:${channelId}`, `verify_peer:${channelId}`],
-                remaining,
-            );
-
-            if (msg.type === 'verify_peer') {
-                verify = msg;
-                break;
-            }
-
-            // Respond to challenge
-            const nonce = Buffer.from(msg.nonce!, 'base64url');
-            const mac = computeChallengeMac(encKey, channelId, nonce, this.id, myRole);
-            this.sendRaw({
-                type: 'response',
-                ch: channelId,
-                mac: mac.toString('base64url'),
-            });
-        }
-
-        // Verify peer's MAC
-        const peerNonce = Buffer.from(verify.peerNonce!, 'base64url');
-        const peerMac = Buffer.from(verify.peerMac!, 'base64url');
-        const peerIdFromVerify = verify.peerId ?? peerId;
-        const peerRole = verify.peerRole ?? (myRole === 'initiator' ? 'responder' : 'initiator');
-        const expectedMac = computeChallengeMac(encKey, channelId, peerNonce, peerIdFromVerify, peerRole);
-
-        if (peerIdFromVerify === this.id) {
-            this.sendRaw({ type: 'error', code: 'verify_rejected', ch: channelId });
-            throw new Error('Peer verification failed: peerId equals own id (possible reflection)');
-        }
-
-        if (!crypto.timingSafeEqual(peerMac, expectedMac)) {
-            this.sendRaw({ type: 'error', code: 'verify_rejected', ch: channelId });
-            throw new Error('Peer verification failed: MAC mismatch');
-        }
-
-        const channelState: ChannelState = {
-            channelId,
-            encKey,
-            role: myRole,
-            peerId: peerIdFromVerify,
-            active: true,
-        };
-
-        this.channels.set(channelId, channelState);
-        return channelState;
-    }
-
-    async rejoin(channelId: string, encKey: Buffer, role: 'initiator' | 'responder'): Promise<ChannelState> {
         this.sendRaw({
             type: 'join',
             ch: channelId,
@@ -300,28 +230,90 @@ export class LatchClient {
                 break;
             }
 
-            const nonce = Buffer.from(msg.nonce!, 'base64url');
-            const mac = computeChallengeMac(encKey, channelId, nonce, this.id, role);
+            const nonce = fromBase64url(msg.nonce!);
+            const mac = await computeChallengeMac(encKey, channelId, nonce, this.id, myRole);
             this.sendRaw({
                 type: 'response',
                 ch: channelId,
-                mac: mac.toString('base64url'),
+                mac: toBase64url(mac),
             });
         }
 
         // Verify peer's MAC
-        const peerNonce = Buffer.from(verify.peerNonce!, 'base64url');
-        const peerMac = Buffer.from(verify.peerMac!, 'base64url');
+        const peerNonce = fromBase64url(verify.peerNonce!);
+        const peerMac = fromBase64url(verify.peerMac!);
+        const peerIdFromVerify = verify.peerId ?? peerId;
+        const peerRole = verify.peerRole ?? (myRole === 'initiator' ? 'responder' : 'initiator');
+        const expectedMac = await computeChallengeMac(encKey, channelId, peerNonce, peerIdFromVerify, peerRole);
+
+        if (peerIdFromVerify === this.id) {
+            this.sendRaw({ type: 'error', code: 'verify_rejected', ch: channelId });
+            throw new Error('Peer verification failed: peerId equals own id (possible reflection)');
+        }
+
+        if (!timingSafeEqual(peerMac, expectedMac)) {
+            this.sendRaw({ type: 'error', code: 'verify_rejected', ch: channelId });
+            throw new Error('Peer verification failed: MAC mismatch');
+        }
+
+        const channelState: ChannelState = {
+            channelId,
+            encKey,
+            role: myRole,
+            peerId: peerIdFromVerify,
+            active: true,
+        };
+
+        this.channels.set(channelId, channelState);
+        return channelState;
+    }
+
+    async rejoin(channelId: string, encKey: Uint8Array, role: 'initiator' | 'responder'): Promise<ChannelState> {
+        this.sendRaw({
+            type: 'join',
+            ch: channelId,
+            id: this.id,
+        });
+
+        // Challenge-response loop
+        let verify: InMsg | undefined;
+        const deadline = Date.now() + 30000;
+        while (!verify) {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw new Error('Timed out waiting for verify_peer');
+
+            const msg = await this.waitForAny(
+                [`challenge:${channelId}`, `verify_peer:${channelId}`],
+                remaining,
+            );
+
+            if (msg.type === 'verify_peer') {
+                verify = msg;
+                break;
+            }
+
+            const nonce = fromBase64url(msg.nonce!);
+            const mac = await computeChallengeMac(encKey, channelId, nonce, this.id, role);
+            this.sendRaw({
+                type: 'response',
+                ch: channelId,
+                mac: toBase64url(mac),
+            });
+        }
+
+        // Verify peer's MAC
+        const peerNonce = fromBase64url(verify.peerNonce!);
+        const peerMac = fromBase64url(verify.peerMac!);
         const peerId = verify.peerId ?? '';
         const peerRole = verify.peerRole ?? (role === 'initiator' ? 'responder' : 'initiator');
-        const expectedMac = computeChallengeMac(encKey, channelId, peerNonce, peerId, peerRole);
+        const expectedMac = await computeChallengeMac(encKey, channelId, peerNonce, peerId, peerRole);
 
         if (peerId === this.id) {
             this.sendRaw({ type: 'error', code: 'verify_rejected', ch: channelId });
             throw new Error('Peer verification failed: peerId equals own id (possible reflection)');
         }
 
-        if (!crypto.timingSafeEqual(peerMac, expectedMac)) {
+        if (!timingSafeEqual(peerMac, expectedMac)) {
             this.sendRaw({ type: 'error', code: 'verify_rejected', ch: channelId });
             throw new Error('Peer verification failed: MAC mismatch');
         }
@@ -338,15 +330,15 @@ export class LatchClient {
         return channelState;
     }
 
-    async send(channelId: string, data: Buffer): Promise<void> {
+    async send(channelId: string, data: Uint8Array): Promise<void> {
         const ch = this.channels.get(channelId);
         if (!ch) throw new Error(`Unknown channel: ${channelId}`);
 
-        const ciphertext = encrypt(ch.encKey, channelId, data);
+        const ciphertext = await encrypt(ch.encKey, channelId, data);
         this.sendRaw({
             type: 'message',
             ch: channelId,
-            data: ciphertext.toString('base64url'),
+            data: toBase64url(ciphertext),
         });
     }
 

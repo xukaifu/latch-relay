@@ -30,7 +30,7 @@ func newTestBridge(t *testing.T) *Bridge {
 // testServer creates a test HTTP server with the bridge handler.
 func testServer(b *Bridge) *httptest.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/connect", HandleConnect(b, 60*time.Second, 256*1024))
+	mux.HandleFunc("/v1/connect", HandleConnect(b, 60*time.Second, 256*1024, false))
 	return httptest.NewServer(mux)
 }
 
@@ -707,7 +707,7 @@ func TestHealthzEndpoint(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
-	mux.HandleFunc("/v1/connect", HandleConnect(b, 60*time.Second, 256*1024))
+	mux.HandleFunc("/v1/connect", HandleConnect(b, 60*time.Second, 256*1024, false))
 	s := httptest.NewServer(mux)
 	defer s.Close()
 

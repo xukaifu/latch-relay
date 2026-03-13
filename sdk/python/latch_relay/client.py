@@ -67,6 +67,12 @@ class LatchClient:
                         fut.set_result(msg)
                     continue
 
+                if msg_type == "peer_left":
+                    ch_state = self._channels.get(ch)
+                    if ch_state:
+                        ch_state.active = False
+                    continue
+
                 if msg_type == "message":
                     await self._message_queue.put(msg)
                     continue
@@ -90,7 +96,7 @@ class LatchClient:
         key = f"{msg_type}:{ch}"
         if key not in self._waiters:
             self._waiters[key] = []
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self._waiters[key].append(fut)
         return fut
@@ -121,7 +127,7 @@ class LatchClient:
         })
 
         # Wait for pair_matched
-        matched = await asyncio.wait_for(pair_matched_fut, timeout=600)
+        matched = await asyncio.wait_for(pair_matched_fut, timeout=30)
         role = matched["role"]
         peer_pub_share = _b64url_decode(matched["pubShare"])
         peer_id = matched["id"]
@@ -153,9 +159,9 @@ class LatchClient:
         })
 
         verify_msg = None
-        deadline = asyncio.get_event_loop().time() + 30.0
+        deadline = asyncio.get_running_loop().time() + 30.0
         while verify_msg is None:
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise asyncio.TimeoutError("Timed out waiting for verify_peer")
 
@@ -228,7 +234,7 @@ class LatchClient:
         (current_id, current_w), (prev_id, prev_w) = crypto.derive_pairing_both_windows(code)
         try:
             return await self._pair_with_params(current_id, current_w)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ConnectionError, OSError):
             return await self._pair_with_params(prev_id, prev_w)
 
     async def rejoin(self, channel_id: str, enc_key: bytes, role: str) -> ChannelState:
@@ -240,9 +246,9 @@ class LatchClient:
         })
 
         verify_msg = None
-        deadline = asyncio.get_event_loop().time() + 30.0
+        deadline = asyncio.get_running_loop().time() + 30.0
         while verify_msg is None:
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise asyncio.TimeoutError("Timed out waiting for verify_peer")
 

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -16,10 +17,30 @@ func marshalJSON(msg OutMsg) ([]byte, error) {
 	return json.Marshal(msg)
 }
 
+// clientIP extracts the client IP. When trustProxy is true, it reads
+// X-Forwarded-For / X-Real-IP headers; otherwise it uses RemoteAddr only.
+func clientIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if i := strings.IndexByte(xff, ','); i != -1 {
+				xff = xff[:i]
+			}
+			if ip := strings.TrimSpace(xff); ip != "" {
+				return ip
+			}
+		}
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return strings.TrimSpace(xri)
+		}
+	}
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return ip
+}
+
 // HandleConnect returns an HTTP handler that upgrades to WebSocket and runs the relay.
-func HandleConnect(b *Bridge, idleTimeout time.Duration, maxMsgSize int64) http.HandlerFunc {
+func HandleConnect(b *Bridge, idleTimeout time.Duration, maxMsgSize int64, trustProxy bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		ip := clientIP(r, trustProxy)
 		if !b.connRate.Allow(ip) {
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return

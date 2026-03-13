@@ -75,6 +75,9 @@ function derivePairingParamsForWindow(code: string, window: number): PairingPara
     const pairingId = hkdfExpand(seedBuf, 'roomId', 32).toString('hex');
     const wBytes = hkdfExpand(seedBuf, 'spake2-w', 48);
     const w = bytesToBigInt(wBytes) % P256_ORDER;
+    if (w === 0n) {
+        throw new Error('derived w is zero');
+    }
     return { pairingId, w };
 }
 
@@ -188,6 +191,9 @@ export function encrypt(encKey: Buffer, channelId: string, plaintext: Buffer): B
 }
 
 export function decrypt(encKey: Buffer, channelId: string, ciphertext: Buffer): Buffer {
+    if (ciphertext.length < 28) {
+        throw new Error('ciphertext too short: must be at least 28 bytes (12 nonce + 16 tag)');
+    }
     const nonce = ciphertext.subarray(0, 12);
     const tag = ciphertext.subarray(ciphertext.length - 16);
     const data = ciphertext.subarray(12, ciphertext.length - 16);

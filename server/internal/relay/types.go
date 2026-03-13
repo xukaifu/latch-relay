@@ -25,6 +25,7 @@ const (
 	ErrVerifyRejected   = "verify_rejected"
 	ErrReplaced         = "replaced"
 	ErrRateLimited      = "rate_limited"
+	ErrInternal         = "internal_error"
 )
 
 // Connection represents a single WebSocket connection.

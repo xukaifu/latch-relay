@@ -132,6 +132,8 @@ def _derive_pairing_for_window(code: str, window: int) -> tuple[str, int]:
     pairing_id = hkdf_expand(seed, b"roomId", 32).hex()
     w_bytes = hkdf_expand(seed, b"spake2-w", 48)
     w = int.from_bytes(w_bytes, "big") % P256_ORDER
+    if w == 0:
+        raise ValueError("Derived w is zero; invalid pairing parameters")
     return pairing_id, w
 
 
@@ -262,6 +264,8 @@ def encrypt(enc_key: bytes, plaintext: bytes, channel_id: str) -> bytes:
 
 def decrypt(enc_key: bytes, data: bytes, channel_id: str) -> bytes:
     """AES-256-GCM decrypt. Input is nonce(12) || ciphertext+tag."""
+    if len(data) < 28:
+        raise ValueError("ciphertext too short")
     nonce = data[:12]
     ct = data[12:]
     aesgcm = AESGCM(enc_key)

@@ -568,8 +568,13 @@ func (c *LatchClient) debounceChallenge(channelID, currentNonce string) string {
 			// so just respond to what we have if it's something else
 			// Actually this is tricky. For now, if we get a non-challenge
 			// message during debounce, just stop debouncing.
-			// Push it back by creating a goroutine.
-			go func() { c.inbox <- msg }()
+			// Push it back, but guard against blocking if client is closing.
+			go func() {
+				select {
+				case c.inbox <- msg:
+				case <-c.closed:
+				}
+			}()
 			return currentNonce
 		case <-timer.C:
 			return currentNonce

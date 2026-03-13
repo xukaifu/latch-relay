@@ -3,7 +3,8 @@ import CryptoKit
 
 // MARK: - Wire protocol message types
 
-struct InMsg: Codable {
+/// OutMsg is what the client sends (outgoing to server).
+struct OutMsg: Codable {
     var type: String
     var ch: String?
     var id: String?
@@ -14,7 +15,8 @@ struct InMsg: Codable {
     var role: String?
 }
 
-struct OutMsg: Codable {
+/// InMsg is what the client receives (incoming from server).
+struct InMsg: Codable {
     var type: String
     var ch: String?
     var pubShare: String?
@@ -54,10 +56,10 @@ public class LatchClient {
     private let session: URLSession
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private var continuations: [String: CheckedContinuation<OutMsg, Error>] = [:]
-    private var challengeContinuations: [String: CheckedContinuation<OutMsg, Error>] = [:]
-    private var verifyPeerContinuations: [String: CheckedContinuation<OutMsg, Error>] = [:]
-    private var pairContinuations: [String: CheckedContinuation<OutMsg, Error>] = [:]
+    private var continuations: [String: CheckedContinuation<InMsg, Error>] = [:]
+    private var challengeContinuations: [String: CheckedContinuation<InMsg, Error>] = [:]
+    private var verifyPeerContinuations: [String: CheckedContinuation<InMsg, Error>] = [:]
+    private var pairContinuations: [String: CheckedContinuation<InMsg, Error>] = [:]
     private let lock = NSLock()
     private var receiveTask: Task<Void, Never>?
 
@@ -101,7 +103,7 @@ public class LatchClient {
     /// Returns the channel state after successful SPAKE2 key agreement and channel establishment.
     public func pair(code: String) async throws -> ChannelState {
         guard webSocket != nil else { throw LatchRelayError.connectionClosed }
-        let (current, previous) = derivePairingParamsBothWindows(code: code)
+        let (current, previous) = try derivePairingParamsBothWindows(code: code)
         do {
             return try await pairWithParams(pairingId: current.pairingId, w: current.w)
         } catch LatchRelayError.timeout {
@@ -115,7 +117,7 @@ public class LatchClient {
         let (scalar, pubShare) = spake2Start(w: w)
 
         // Send pair message
-        let pairMsg = InMsg(
+        let pairMsg = OutMsg(
             type: "pair",
             ch: pairingId,
             id: id,
@@ -124,10 +126,17 @@ public class LatchClient {
         try await sendJSON(pairMsg)
 
         // Wait for pair_matched
-        let matched: OutMsg = try await withCheckedThrowingContinuation { cont in
-            lock.lock()
-            pairContinuations[pairingId] = cont
-            lock.unlock()
+        let matched: InMsg = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                self.lock.lock()
+                self.pairContinuations[pairingId] = cont
+                self.lock.unlock()
+            }
+        } onCancel: {
+            self.lock.lock()
+            let cont = self.pairContinuations.removeValue(forKey: pairingId)
+            self.lock.unlock()
+            cont?.resume(throwing: CancellationError())
         }
 
         guard matched.type == "pair_matched" else {
@@ -157,71 +166,24 @@ public class LatchClient {
             )
         }
 
-        // Join the channel
-        let joinMsg = InMsg(type: "join", ch: channelId, id: id)
+        // Join the channel and run challenge-response flow
+        return try await joinAndChallenge(channelId: channelId, encKey: encKey, role: role, expectedPeerId: peerId)
+    }
+
+    /// Join a channel and complete the challenge-response verification flow.
+    /// Used by both pair() and rejoin().
+    private func joinAndChallenge(channelId: String, encKey: SymmetricKey, role: String, expectedPeerId: String = "") async throws -> ChannelState {
+        let joinMsg = OutMsg(type: "join", ch: channelId, id: id)
         try await sendJSON(joinMsg)
 
-        // Wait for challenge
-        let challenge: OutMsg = try await withCheckedThrowingContinuation { cont in
-            lock.lock()
-            challengeContinuations[channelId] = cont
-            lock.unlock()
+        // Challenge loop: wait for challenges and verify_peer.
+        // Re-challenges can arrive when the second peer joins, so we loop
+        // responding to each challenge until we receive verify_peer.
+        // Both challenge and verify_peer continuations are registered before
+        // each wait so no messages are dropped.
+        let verify: InMsg = try await withTimeout(seconds: 30) {
+            try await self.challengeLoop(channelId: channelId, encKey: encKey, role: role)
         }
-
-        guard challenge.type == "challenge",
-              let nonceB64 = challenge.nonce,
-              let nonce = base64urlDecode(nonceB64) else {
-            throw LatchRelayError.channelError("expected challenge")
-        }
-
-        // We might get re-challenged when the second peer joins.
-        // Register for the next challenge/verify_peer before responding.
-        // Actually, the protocol flow is:
-        // 1. First peer joins -> gets challenge (WAIT_PEER state)
-        // 2. Second peer joins -> both get fresh challenges
-        // 3. Both respond
-        // 4. Both get verify_peer
-
-        // We need to handle the re-challenge case. If we're the first to join,
-        // we'll get a challenge, then when the peer joins we get another challenge.
-        // Let's wait for the final challenge by also registering for the next one.
-
-        // Send response with initial challenge nonce first
-        // Actually, we might get re-challenged. Let's handle both cases.
-        // Register verify_peer continuation now.
-        let verifyPromise: Task<OutMsg, Error> = Task {
-            try await withCheckedThrowingContinuation { cont in
-                self.lock.lock()
-                self.verifyPeerContinuations[channelId] = cont
-                self.lock.unlock()
-            }
-        }
-
-        // We might get a re-challenge. Let's also listen for that.
-        // Register another challenge continuation
-        let reChallengeTask: Task<OutMsg?, Error> = Task {
-            try await withCheckedThrowingContinuation { cont in
-                self.lock.lock()
-                self.challengeContinuations[channelId] = cont
-                self.lock.unlock()
-            }
-        }
-
-        // Compute and send MAC for the first challenge
-        let mac = computeChallengeMAC(encKey: encKey, channelId: channelId, nonce: nonce, id: id, role: role)
-        let responseMsg = InMsg(type: "response", ch: channelId, mac: base64urlEncode(mac))
-        try await sendJSON(responseMsg)
-
-        // Wait for either verify_peer or re-challenge
-        // The verify_peer task or the re-challenge task will complete.
-        // We use a simple approach: check if we get a re-challenge within a short window.
-
-        // Actually, let's simplify. We'll handle re-challenges in the receive loop
-        // by updating the challenge continuation. The verify_peer continuation
-        // is what we truly wait for.
-
-        // Wait for verify_peer (might be preceded by re-challenge handled in receive loop)
-        let verify = try await verifyPromise.value
 
         guard verify.type == "verify_peer" else {
             throw LatchRelayError.channelError("expected verify_peer")
@@ -235,12 +197,12 @@ public class LatchClient {
             throw LatchRelayError.channelError("missing verify_peer fields")
         }
 
-        let actualPeerId = verify.peerId ?? peerId
+        let actualPeerId = verify.peerId ?? expectedPeerId
         let peerRole = verify.peerRole ?? (role == "initiator" ? "responder" : "initiator")
 
         // Reject if peer has the same ID as us (self-pairing)
         if actualPeerId == id {
-            let rejectMsg = InMsg(type: "error", ch: channelId, code: "verify_rejected")
+            let rejectMsg = OutMsg(type: "error", ch: channelId, code: "verify_rejected")
             try await sendJSON(rejectMsg)
             throw LatchRelayError.verifyRejected
         }
@@ -251,8 +213,7 @@ public class LatchClient {
         )
 
         if !valid {
-            // Send verify_rejected
-            let rejectMsg = InMsg(type: "error", ch: channelId, code: "verify_rejected")
+            let rejectMsg = OutMsg(type: "error", ch: channelId, code: "verify_rejected")
             try await sendJSON(rejectMsg)
             throw LatchRelayError.verifyRejected
         }
@@ -266,11 +227,129 @@ public class LatchClient {
         )
         lock.lock()
         channels[channelId] = state
-        // Cancel the re-challenge task if still pending
-        reChallengeTask.cancel()
         lock.unlock()
 
         return state
+    }
+
+    /// Rejoin an existing channel after reconnection.
+    public func rejoin(channelId: String, encKey: Data, role: String) async throws -> ChannelState {
+        guard webSocket != nil else { throw LatchRelayError.connectionClosed }
+        let symKey = SymmetricKey(data: encKey)
+        return try await joinAndChallenge(channelId: channelId, encKey: symKey, role: role)
+    }
+
+    /// Challenge-response loop: waits for challenge/verify_peer messages,
+    /// responds to challenges, returns verify_peer when received.
+    /// Fixes the race condition by always registering the next challenge
+    /// continuation before consuming the current one.
+    private func challengeLoop(channelId: String, encKey: SymmetricKey, role: String) async throws -> InMsg {
+        // Wait for initial challenge
+        let challenge: InMsg = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                self.lock.lock()
+                self.challengeContinuations[channelId] = cont
+                self.lock.unlock()
+            }
+        } onCancel: {
+            self.lock.lock()
+            let cont = self.challengeContinuations.removeValue(forKey: channelId)
+            self.lock.unlock()
+            cont?.resume(throwing: CancellationError())
+        }
+
+        guard challenge.type == "challenge",
+              let nonceB64 = challenge.nonce,
+              var nonce = base64urlDecode(nonceB64) else {
+            throw LatchRelayError.channelError("expected challenge")
+        }
+
+        // After receiving a challenge, respond and wait for verify_peer.
+        // A re-challenge may arrive if we're the first peer and the second
+        // peer joins after our initial challenge. We loop to handle this.
+        while true {
+            // Register re-challenge continuation BEFORE verify_peer and response,
+            // so no re-challenge is dropped in between.
+            let reChallengeTask = Task<InMsg, Error> {
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { cont in
+                        self.lock.lock()
+                        self.challengeContinuations[channelId] = cont
+                        self.lock.unlock()
+                    }
+                } onCancel: {
+                    self.lock.lock()
+                    let cont = self.challengeContinuations.removeValue(forKey: channelId)
+                    self.lock.unlock()
+                    cont?.resume(throwing: CancellationError())
+                }
+            }
+
+            let verifyTask = Task<InMsg, Error> {
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { cont in
+                        self.lock.lock()
+                        self.verifyPeerContinuations[channelId] = cont
+                        self.lock.unlock()
+                    }
+                } onCancel: {
+                    self.lock.lock()
+                    let cont = self.verifyPeerContinuations.removeValue(forKey: channelId)
+                    self.lock.unlock()
+                    cont?.resume(throwing: CancellationError())
+                }
+            }
+
+            // Respond to the current challenge
+            let mac = computeChallengeMAC(encKey: encKey, channelId: channelId, nonce: nonce, id: id, role: role)
+            let responseMsg = OutMsg(type: "response", ch: channelId, mac: base64urlEncode(mac))
+            try await sendJSON(responseMsg)
+
+            // Race: wait for verify_peer or re-challenge
+            let result: InMsg = try await withThrowingTaskGroup(of: InMsg.self) { group in
+                group.addTask { try await verifyTask.value }
+                group.addTask { try await reChallengeTask.value }
+                let first = try await group.next()!
+                group.cancelAll()
+                return first
+            }
+
+            if result.type == "verify_peer" {
+                reChallengeTask.cancel()
+                lock.lock()
+                challengeContinuations.removeValue(forKey: channelId)
+                lock.unlock()
+                return result
+            }
+
+            // Got a re-challenge: update nonce for next iteration
+            verifyTask.cancel()
+            lock.lock()
+            verifyPeerContinuations.removeValue(forKey: channelId)
+            lock.unlock()
+
+            guard let reNonceB64 = result.nonce,
+                  let reNonce = base64urlDecode(reNonceB64) else {
+                throw LatchRelayError.channelError("re-challenge missing nonce")
+            }
+            nonce = reNonce
+        }
+    }
+
+    /// Run an async closure with a timeout.
+    private func withTimeout<T>(seconds: TimeInterval, operation: @escaping () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw LatchRelayError.timeout
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
 
     /// Send encrypted data on a channel.
@@ -284,7 +363,7 @@ public class LatchClient {
 
         let aad = channelId.data(using: .utf8)!
         let encrypted = try aesGCMEncrypt(plaintext: data, key: channel.encKey, aad: aad)
-        let msg = InMsg(type: "message", ch: channelId, data: base64urlEncode(encrypted))
+        let msg = OutMsg(type: "message", ch: channelId, data: base64urlEncode(encrypted))
         try await sendJSON(msg)
     }
 
@@ -295,7 +374,7 @@ public class LatchClient {
 
     /// Leave a channel.
     public func leave(channelId: String) async throws {
-        let msg = InMsg(type: "leave", ch: channelId)
+        let msg = OutMsg(type: "leave", ch: channelId)
         try await sendJSON(msg)
         lock.lock()
         channels[channelId]?.active = false
@@ -311,7 +390,7 @@ public class LatchClient {
 
     // MARK: - Private
 
-    private func sendJSON(_ msg: InMsg) async throws {
+    private func sendJSON(_ msg: OutMsg) async throws {
         guard let ws = webSocket else { throw LatchRelayError.connectionClosed }
         let data = try encoder.encode(msg)
         try await ws.send(.string(String(data: data, encoding: .utf8)!))
@@ -339,7 +418,7 @@ public class LatchClient {
     }
 
     private func handleMessage(_ data: Data) {
-        guard let msg = try? decoder.decode(OutMsg.self, from: data) else { return }
+        guard let msg = try? decoder.decode(InMsg.self, from: data) else { return }
 
         switch msg.type {
         case "pair_matched":
@@ -399,7 +478,7 @@ public class LatchClient {
         }
     }
 
-    private func handleReChallenge(_ msg: OutMsg) {
+    private func handleReChallenge(_ msg: InMsg) {
         // During pairing, we might receive a re-challenge after sending our initial response.
         // We need to compute a new MAC and send a new response.
         let ch = msg.ch ?? ""
@@ -421,14 +500,14 @@ public class LatchClient {
             encKey: channel.encKey, channelId: ch,
             nonce: nonce, id: id, role: channel.role
         )
-        let responseMsg = InMsg(type: "response", ch: ch, mac: base64urlEncode(mac))
+        let responseMsg = OutMsg(type: "response", ch: ch, mac: base64urlEncode(mac))
 
         Task {
             try? await sendJSON(responseMsg)
         }
     }
 
-    private func handleRelayedMessage(_ msg: OutMsg) {
+    private func handleRelayedMessage(_ msg: InMsg) {
         let ch = msg.ch ?? ""
         guard let channel = channels[ch],
               let dataB64 = msg.data,

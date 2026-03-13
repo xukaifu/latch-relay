@@ -36,7 +36,9 @@ func (rl *RateLimiter) Allow(key string) bool {
 	for start < len(times) && times[start].Before(cutoff) {
 		start++
 	}
-	times = times[start:]
+	if start > 0 {
+		times = append([]time.Time(nil), times[start:]...)
+	}
 
 	if len(times) == 0 {
 		delete(rl.windows, key)

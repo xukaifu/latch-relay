@@ -1,0 +1,18 @@
+{
+  "name": "latch-relay-sdk-browser",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
