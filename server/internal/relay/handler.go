@@ -36,6 +36,7 @@ func HandleConnect(b *Bridge, idleTimeout time.Duration, maxMsgSize int64) http.
 
 		conn := &Connection{
 			Conn:     ws,
+			IP:       ip,
 			Channels: make(map[string]bool),
 		}
 		b.RegisterConn(conn)

@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -783,6 +784,74 @@ func TestLeaveOnePeerChannelSurvives(t *testing.T) {
 		t.Fatalf("expected WAIT_PEER state, got %q", ch.State)
 	}
 	ch.mu.Unlock()
+}
+
+func TestMaxPairingsPerIPRateLimit(t *testing.T) {
+	b := NewBridge(BridgeConfig{
+		MaxChannelsTotal: 100,
+		MaxMessageSize:   256 * 1024,
+		PairingTTL:       10 * time.Minute,
+		IdleTimeout:      60 * time.Second,
+		ChallengeTimeout: 10 * time.Second,
+		WaitPeerTimeout:  30 * time.Second,
+	})
+	t.Cleanup(b.Close)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	for i := 0; i < 5; i++ {
+		send(t, ws, InMsg{
+			Type:     "pair",
+			Ch:       fmt.Sprintf("pair-%d", i),
+			PubShare: b64.EncodeToString([]byte("pub")),
+			ID:       "peer",
+		})
+	}
+
+	// 6th should be rate limited
+	send(t, ws, InMsg{
+		Type:     "pair",
+		Ch:       "pair-5",
+		PubShare: b64.EncodeToString([]byte("pub")),
+		ID:       "peer",
+	})
+
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != "rate_limited" {
+		t.Fatalf("expected rate_limited, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestMaxChannelsPerIPRateLimit(t *testing.T) {
+	b := NewBridge(BridgeConfig{
+		MaxChannelsTotal: 100,
+		MaxMessageSize:   256 * 1024,
+		PairingTTL:       10 * time.Minute,
+		IdleTimeout:      60 * time.Second,
+		ChallengeTimeout: 10 * time.Second,
+		WaitPeerTimeout:  30 * time.Second,
+	})
+	t.Cleanup(b.Close)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	for i := 0; i < 20; i++ {
+		send(t, ws, InMsg{Type: "join", Ch: fmt.Sprintf("ch-%d", i), ID: "peer"})
+		recv(t, ws) // challenge
+	}
+
+	// 21st should be rate limited
+	send(t, ws, InMsg{Type: "join", Ch: "ch-20", ID: "peer"})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != "rate_limited" {
+		t.Fatalf("expected rate_limited, got type=%q code=%q", msg.Type, msg.Code)
+	}
 }
 
 // setupActiveChannel sets up a fully active channel between two websockets.

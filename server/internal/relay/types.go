@@ -32,6 +32,7 @@ const (
 type Connection struct {
 	Conn     *websocket.Conn
 	ID       string
+	IP       string // originating IP address
 	Channels map[string]bool // channelIds this connection has joined
 	mu       sync.Mutex
 }

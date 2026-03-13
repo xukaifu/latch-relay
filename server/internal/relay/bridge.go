@@ -40,6 +40,8 @@ type Bridge struct {
 	cfg          BridgeConfig
 	connRate     *RateLimiter // per-IP connection rate
 	joinRate     *RateLimiter // per-channelId join rate
+	pairRate     *RateLimiter // per-IP pairing rate (MaxPairingsPerIP = 5)
+	channelRate  *RateLimiter // per-IP channel rate (MaxChannelsPerIP = 20)
 	stop         chan struct{}
 }
 
@@ -52,6 +54,8 @@ func NewBridge(cfg BridgeConfig) *Bridge {
 		cfg:          cfg,
 		connRate:     NewRateLimiter(10, time.Second),
 		joinRate:     NewRateLimiter(3, 10*time.Second),
+		pairRate:     NewRateLimiter(5, 10*time.Minute),
+		channelRate:  NewRateLimiter(20, 10*time.Minute),
 		stop:         make(chan struct{}),
 	}
 	go b.cleanupLoop()
@@ -100,6 +104,8 @@ func (b *Bridge) cleanupLoop() {
 		// Prune stale rate-limiter entries to prevent unbounded memory growth
 		b.connRate.Cleanup()
 		b.joinRate.Cleanup()
+		b.pairRate.Cleanup()
+		b.channelRate.Cleanup()
 	}
 }
 
@@ -184,6 +190,11 @@ func (b *Bridge) handlePair(conn *Connection, msg InMsg) {
 		return
 	}
 
+	if !b.pairRate.Allow(conn.IP) {
+		sendMsg(conn, OutMsg{Type: "error", Code: ErrRateLimited, Ch: msg.Ch, Message: "pairing rate exceeded"})
+		return
+	}
+
 	b.mu.Lock()
 
 	wp, exists := b.waitingPeers[msg.Ch]
@@ -246,6 +257,11 @@ func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
 
 	if !b.joinRate.Allow(msg.Ch) {
 		sendMsg(conn, OutMsg{Type: "error", Code: ErrRateLimited, Ch: msg.Ch, Message: "join rate exceeded"})
+		return
+	}
+
+	if !b.channelRate.Allow(conn.IP) {
+		sendMsg(conn, OutMsg{Type: "error", Code: ErrRateLimited, Ch: msg.Ch, Message: "channel rate exceeded"})
 		return
 	}
 
