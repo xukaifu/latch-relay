@@ -50,6 +50,7 @@ type outMsg struct {
 	Mac      string `json:"mac,omitempty"`
 	Data     string `json:"data,omitempty"`
 	Role     string `json:"role,omitempty"`
+	Code     string `json:"code,omitempty"`
 }
 
 // LatchClient is a WebSocket client for the latch-relay server.
@@ -162,7 +163,6 @@ func (c *LatchClient) PairDirect(pairingID string, w *big.Int) (*ChannelState, e
 		Type: "join",
 		Ch:   channelID,
 		ID:   c.id,
-		Role: role,
 	}); err != nil {
 		return nil, fmt.Errorf("send join: %w", err)
 	}
@@ -177,6 +177,11 @@ func (c *LatchClient) PairDirect(pairingID string, w *big.Int) (*ChannelState, e
 		return nil, err
 	}
 
+	if verifyMsg.PeerID == c.id {
+		c.send(outMsg{Type: "error", Code: "verify_rejected", Ch: channelID})
+		return nil, fmt.Errorf("verify_peer contains own ID (possible reflection attack)")
+	}
+
 	peerNonce, err := b64.DecodeString(verifyMsg.PeerNonce)
 	if err != nil {
 		return nil, fmt.Errorf("decode peer nonce: %w", err)
@@ -186,7 +191,17 @@ func (c *LatchClient) PairDirect(pairingID string, w *big.Int) (*ChannelState, e
 		return nil, fmt.Errorf("decode peer mac: %w", err)
 	}
 
-	if !VerifyChallengeMac(encKey, channelID, peerNonce, verifyMsg.PeerID, verifyMsg.PeerRole, peerMac) {
+	peerRole := verifyMsg.PeerRole
+	if peerRole == "" {
+		if role == "initiator" {
+			peerRole = "responder"
+		} else {
+			peerRole = "initiator"
+		}
+	}
+
+	if !VerifyChallengeMac(encKey, channelID, peerNonce, verifyMsg.PeerID, peerRole, peerMac) {
+		c.send(outMsg{Type: "error", Code: "verify_rejected", Ch: channelID})
 		return nil, fmt.Errorf("peer MAC verification failed")
 	}
 
@@ -211,7 +226,6 @@ func (c *LatchClient) Rejoin(channelID string, encKey []byte, role string) error
 		Type: "join",
 		Ch:   channelID,
 		ID:   c.id,
-		Role: role,
 	}); err != nil {
 		return fmt.Errorf("send join: %w", err)
 	}
@@ -219,6 +233,11 @@ func (c *LatchClient) Rejoin(channelID string, encKey []byte, role string) error
 	verifyMsg, err := c.challengeLoop(channelID, encKey, role)
 	if err != nil {
 		return err
+	}
+
+	if verifyMsg.PeerID == c.id {
+		c.send(outMsg{Type: "error", Code: "verify_rejected", Ch: channelID})
+		return fmt.Errorf("verify_peer contains own ID (possible reflection attack)")
 	}
 
 	peerNonce, err := b64.DecodeString(verifyMsg.PeerNonce)
@@ -230,7 +249,17 @@ func (c *LatchClient) Rejoin(channelID string, encKey []byte, role string) error
 		return fmt.Errorf("decode peer mac: %w", err)
 	}
 
-	if !VerifyChallengeMac(encKey, channelID, peerNonce, verifyMsg.PeerID, verifyMsg.PeerRole, peerMac) {
+	peerRole := verifyMsg.PeerRole
+	if peerRole == "" {
+		if role == "initiator" {
+			peerRole = "responder"
+		} else {
+			peerRole = "initiator"
+		}
+	}
+
+	if !VerifyChallengeMac(encKey, channelID, peerNonce, verifyMsg.PeerID, peerRole, peerMac) {
+		c.send(outMsg{Type: "error", Code: "verify_rejected", Ch: channelID})
 		return fmt.Errorf("peer MAC verification failed")
 	}
 
@@ -401,7 +430,6 @@ func (c *LatchClient) autoRespondChallenge(msg inMsg) bool {
 		Type: "response",
 		Ch:   cs.ChannelID,
 		Mac:  b64.EncodeToString(mac),
-		Role: cs.Role,
 	})
 
 	return true
@@ -417,6 +445,10 @@ func (c *LatchClient) autoHandleVerifyPeer(msg inMsg) bool {
 		return false
 	}
 
+	if msg.PeerID == c.id {
+		return true // consume but don't activate — own ID reflection
+	}
+
 	peerNonce, err := b64.DecodeString(msg.PeerNonce)
 	if err != nil {
 		return false
@@ -426,7 +458,16 @@ func (c *LatchClient) autoHandleVerifyPeer(msg inMsg) bool {
 		return false
 	}
 
-	if VerifyChallengeMac(cs.EncKey, cs.ChannelID, peerNonce, msg.PeerID, msg.PeerRole, peerMac) {
+	peerRole := msg.PeerRole
+	if peerRole == "" {
+		if cs.Role == "initiator" {
+			peerRole = "responder"
+		} else {
+			peerRole = "initiator"
+		}
+	}
+
+	if VerifyChallengeMac(cs.EncKey, cs.ChannelID, peerNonce, msg.PeerID, peerRole, peerMac) {
 		c.mu.Lock()
 		cs.PeerID = msg.PeerID
 		cs.Active = true
@@ -476,7 +517,6 @@ func (c *LatchClient) challengeLoop(channelID string, encKey []byte, role string
 			Type: "response",
 			Ch:   channelID,
 			Mac:  b64.EncodeToString(mac),
-			Role: role,
 		}); err != nil {
 			return inMsg{}, fmt.Errorf("send response: %w", err)
 		}
@@ -500,7 +540,6 @@ func (c *LatchClient) challengeLoop(channelID string, encKey []byte, role string
 				Type: "response",
 				Ch:   channelID,
 				Mac:  b64.EncodeToString(mac2),
-				Role: role,
 			}); err != nil {
 				return inMsg{}, fmt.Errorf("send response: %w", err)
 			}
