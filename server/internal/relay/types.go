@@ -17,8 +17,7 @@ const (
 // Error codes
 const (
 	ErrInvalidMessage   = "invalid_message"
-	ErrPairingFull      = "pairing_full"
-	ErrPairingExpired   = "pairing_expired"
+ErrPairingExpired   = "pairing_expired"
 	ErrChannelFull      = "channel_full"
 	ErrChannelNotFound  = "channel_not_found"
 	ErrNotInChannel     = "not_in_channel"

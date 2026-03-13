@@ -341,7 +341,10 @@ func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
 		for i, peer := range ch.Peers {
 			if peer != nil && peer != member {
 				freshNonce := make([]byte, 32)
-				rand.Read(freshNonce)
+				if _, err := rand.Read(freshNonce); err != nil {
+					log.Printf("failed to generate nonce: %v", err)
+					return
+				}
 				ch.Peers[i].Nonce = freshNonce
 				ch.Peers[i].Response = nil
 				sendMsg(peer.Conn, OutMsg{Type: "challenge", Ch: msg.Ch, Nonce: b64.EncodeToString(freshNonce)})
