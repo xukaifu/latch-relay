@@ -58,7 +58,6 @@ public class LatchClient {
     private let decoder = JSONDecoder()
     private var continuations: [String: CheckedContinuation<InMsg, Error>] = [:]
     private var challengeContinuations: [String: CheckedContinuation<InMsg, Error>] = [:]
-    private var verifyPeerContinuations: [String: CheckedContinuation<InMsg, Error>] = [:]
     private var pairContinuations: [String: CheckedContinuation<InMsg, Error>] = [:]
     private let lock = NSLock()
     private var receiveTask: Task<Void, Never>?
@@ -241,98 +240,42 @@ public class LatchClient {
 
     /// Challenge-response loop: waits for challenge/verify_peer messages,
     /// responds to challenges, returns verify_peer when received.
-    /// Fixes the race condition by always registering the next challenge
-    /// continuation before consuming the current one.
+    ///
+    /// Uses a single continuation (challengeContinuations) for both challenge
+    /// and verify_peer messages. The response send is deferred via Task so
+    /// the next continuation is registered (synchronously) before the send
+    /// executes, preventing a race where verify_peer arrives before we listen.
     private func challengeLoop(channelId: String, encKey: SymmetricKey, role: String) async throws -> InMsg {
-        // Wait for initial challenge
-        let challenge: InMsg = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { cont in
-                self.lock.lock()
-                self.challengeContinuations[channelId] = cont
-                self.lock.unlock()
-            }
-        } onCancel: {
-            self.lock.lock()
-            let cont = self.challengeContinuations.removeValue(forKey: channelId)
-            self.lock.unlock()
-            cont?.resume(throwing: CancellationError())
-        }
-
-        guard challenge.type == "challenge",
-              let nonceB64 = challenge.nonce,
-              var nonce = base64urlDecode(nonceB64) else {
-            throw LatchRelayError.channelError("expected challenge")
-        }
-
-        // After receiving a challenge, respond and wait for verify_peer.
-        // A re-challenge may arrive if we're the first peer and the second
-        // peer joins after our initial challenge. We loop to handle this.
         while true {
-            // Register re-challenge continuation BEFORE verify_peer and response,
-            // so no re-challenge is dropped in between.
-            let reChallengeTask = Task<InMsg, Error> {
-                try await withTaskCancellationHandler {
-                    try await withCheckedThrowingContinuation { cont in
-                        self.lock.lock()
-                        self.challengeContinuations[channelId] = cont
-                        self.lock.unlock()
-                    }
-                } onCancel: {
+            let msg: InMsg = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { cont in
                     self.lock.lock()
-                    let cont = self.challengeContinuations.removeValue(forKey: channelId)
+                    self.challengeContinuations[channelId] = cont
                     self.lock.unlock()
-                    cont?.resume(throwing: CancellationError())
                 }
+            } onCancel: {
+                self.lock.lock()
+                let cont = self.challengeContinuations.removeValue(forKey: channelId)
+                self.lock.unlock()
+                cont?.resume(throwing: CancellationError())
             }
 
-            let verifyTask = Task<InMsg, Error> {
-                try await withTaskCancellationHandler {
-                    try await withCheckedThrowingContinuation { cont in
-                        self.lock.lock()
-                        self.verifyPeerContinuations[channelId] = cont
-                        self.lock.unlock()
-                    }
-                } onCancel: {
-                    self.lock.lock()
-                    let cont = self.verifyPeerContinuations.removeValue(forKey: channelId)
-                    self.lock.unlock()
-                    cont?.resume(throwing: CancellationError())
-                }
+            if msg.type == "verify_peer" {
+                return msg
             }
 
-            // Respond to the current challenge
+            guard msg.type == "challenge",
+                  let nonceB64 = msg.nonce,
+                  let nonce = base64urlDecode(nonceB64) else {
+                throw LatchRelayError.channelError("expected challenge or verify_peer")
+            }
+
+            // Compute MAC and defer the send so the next continuation
+            // (registered at the top of the loop) is in place before
+            // the server can reply.
             let mac = computeChallengeMAC(encKey: encKey, channelId: channelId, nonce: nonce, id: id, role: role)
             let responseMsg = OutMsg(type: "response", ch: channelId, mac: base64urlEncode(mac))
-            try await sendJSON(responseMsg)
-
-            // Race: wait for verify_peer or re-challenge
-            let result: InMsg = try await withThrowingTaskGroup(of: InMsg.self) { group in
-                group.addTask { try await verifyTask.value }
-                group.addTask { try await reChallengeTask.value }
-                let first = try await group.next()!
-                group.cancelAll()
-                return first
-            }
-
-            if result.type == "verify_peer" {
-                reChallengeTask.cancel()
-                lock.lock()
-                challengeContinuations.removeValue(forKey: channelId)
-                lock.unlock()
-                return result
-            }
-
-            // Got a re-challenge: update nonce for next iteration
-            verifyTask.cancel()
-            lock.lock()
-            verifyPeerContinuations.removeValue(forKey: channelId)
-            lock.unlock()
-
-            guard let reNonceB64 = result.nonce,
-                  let reNonce = base64urlDecode(reNonceB64) else {
-                throw LatchRelayError.channelError("re-challenge missing nonce")
-            }
-            nonce = reNonce
+            Task { [self] in try? await sendJSON(responseMsg) }
         }
     }
 
@@ -432,16 +375,11 @@ public class LatchClient {
             lock.lock()
             let cont = challengeContinuations.removeValue(forKey: ch)
             lock.unlock()
-            if let cont = cont {
-                cont.resume(returning: msg)
-            } else {
-                // Re-challenge: we need to re-respond
-                handleReChallenge(msg)
-            }
+            cont?.resume(returning: msg)
 
         case "verify_peer":
             lock.lock()
-            let cont = verifyPeerContinuations.removeValue(forKey: msg.ch ?? "")
+            let cont = challengeContinuations.removeValue(forKey: msg.ch ?? "")
             lock.unlock()
             cont?.resume(returning: msg)
 
@@ -463,47 +401,16 @@ public class LatchClient {
             lock.lock()
             let pairCont = pairContinuations.removeValue(forKey: ch)
             let challengeCont = challengeContinuations.removeValue(forKey: ch)
-            let verifyCont = verifyPeerContinuations.removeValue(forKey: ch)
             lock.unlock()
 
             let error = LatchRelayError.channelError(code)
             pairCont?.resume(throwing: error)
             challengeCont?.resume(throwing: error)
-            verifyCont?.resume(throwing: error)
 
             onError?(ch, code)
 
         default:
             break
-        }
-    }
-
-    private func handleReChallenge(_ msg: InMsg) {
-        // During pairing, we might receive a re-challenge after sending our initial response.
-        // We need to compute a new MAC and send a new response.
-        let ch = msg.ch ?? ""
-        guard let channel = channels[ch] ?? nil else {
-            // Channel not yet fully established - this happens during pairing.
-            // We need the encKey, which we may not have stored yet.
-            // The pair() method handles this via the continuation pattern.
-            // If we get here, it means we got a re-challenge while pair() is still running.
-            // The challenge continuation should have been set up.
-            // Actually this shouldn't happen because pair() registers a new
-            // challengeContinuation before sending the response.
-            return
-        }
-
-        guard let nonceB64 = msg.nonce,
-              let nonce = base64urlDecode(nonceB64) else { return }
-
-        let mac = computeChallengeMAC(
-            encKey: channel.encKey, channelId: ch,
-            nonce: nonce, id: id, role: channel.role
-        )
-        let responseMsg = OutMsg(type: "response", ch: ch, mac: base64urlEncode(mac))
-
-        Task {
-            try? await sendJSON(responseMsg)
         }
     }
 

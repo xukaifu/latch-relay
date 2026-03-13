@@ -20,10 +20,11 @@ import (
 )
 
 var (
-	serverBin   string // path to compiled server binary
-	goE2EBin    string // path to compiled Go E2E client binary
-	swiftE2EBin string // path to compiled Swift E2E client binary
-	repoRoot    string
+	serverBin      string // path to compiled server binary
+	goE2EBin       string // path to compiled Go E2E client binary
+	swiftE2EBin    string // path to compiled Swift E2E client binary
+	browserReady   bool   // whether browser E2E dependencies are installed
+	repoRoot       string
 )
 
 func TestMain(m *testing.M) {
@@ -70,6 +71,22 @@ func TestMain(m *testing.M) {
 		out, err := binPathCmd.Output()
 		if err == nil {
 			swiftE2EBin = filepath.Join(strings.TrimSpace(string(out)), "latch-e2e")
+		}
+	}
+
+	// Prepare browser E2E dependencies
+	browserDir := filepath.Join(root, "e2e", "browser")
+	if _, err := os.Stat(filepath.Join(browserDir, "node_modules")); err == nil {
+		browserReady = true
+	} else {
+		cmd = exec.Command("npm", "install")
+		cmd.Dir = browserDir
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to install browser E2E deps: %v (browser tests will be skipped)\n", err)
+		} else {
+			browserReady = true
 		}
 	}
 
@@ -177,6 +194,18 @@ func runSwiftClient(ctx context.Context, serverURL, id, code, sendMsg string) cl
 	}, "", nil)
 }
 
+// runBrowserClient runs the Playwright-based browser E2E client and returns the result.
+func runBrowserClient(ctx context.Context, serverURL, id, code, sendMsg string) clientResult {
+	runnerScript := filepath.Join(repoRoot, "e2e", "browser", "e2e-runner.mjs")
+	return runCLI(ctx, "node", []string{
+		runnerScript,
+		"--server", serverURL,
+		"--id", id,
+		"--code", code,
+		"--send", sendMsg,
+	}, filepath.Join(repoRoot, "e2e", "browser"), nil)
+}
+
 // runCLI runs a CLI command and parses the first JSON line from stdout.
 func runCLI(ctx context.Context, bin string, args []string, dir string, env []string) clientResult {
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -275,6 +304,20 @@ func TestCrossLanguagePairing(t *testing.T) {
 		)
 	}
 
+	// Add browser pairs if Playwright is available
+	if browserReady {
+		pairs = append(pairs,
+			pair{"go", "browser", runGoClient, runBrowserClient},
+			pair{"python", "browser", runPythonClient, runBrowserClient},
+			pair{"node", "browser", runNodeClient, runBrowserClient},
+		)
+		if swiftE2EBin != "" {
+			pairs = append(pairs,
+				pair{"swift", "browser", runSwiftClient, runBrowserClient},
+			)
+		}
+	}
+
 	cases := make([]testCase, len(pairs))
 	for i, p := range pairs {
 		cases[i].name = p.nameA + "-" + p.nameB
@@ -287,7 +330,11 @@ func TestCrossLanguagePairing(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			timeout := 30 * time.Second
+			if strings.Contains(tc.name, "browser") {
+				timeout = 60 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 
 			code := fmt.Sprintf("test-code-%s-%d", tc.name, rand.Int())
