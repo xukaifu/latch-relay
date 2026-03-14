@@ -59,6 +59,7 @@ func HandleConnect(b *Bridge, idleTimeout time.Duration, maxMsgSize int64, trust
 			Conn:     ws,
 			IP:       ip,
 			Channels: make(map[string]bool),
+			bytesOut: &b.BytesOut,
 		}
 		b.RegisterConn(conn)
 		defer b.UnregisterConn(conn)
@@ -74,6 +75,7 @@ func HandleConnect(b *Bridge, idleTimeout time.Duration, maxMsgSize int64, trust
 			if typ != websocket.MessageText {
 				continue
 			}
+			b.BytesIn.Add(int64(len(data)))
 
 			var msg InMsg
 			if err := json.Unmarshal(data, &msg); err != nil {

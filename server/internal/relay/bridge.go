@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -45,6 +46,70 @@ type Bridge struct {
 	pairRate     *RateLimiter // per-IP pairing rate (MaxPairingsPerIP = 5)
 	channelRate  *RateLimiter // per-IP channel rate (MaxChannelsPerIP = 20)
 	stop         chan struct{}
+	startTime    time.Time
+
+	// Cumulative counters (atomic)
+	BytesIn           atomic.Int64
+	BytesOut          atomic.Int64
+	MessagesRelayed   atomic.Int64
+	PairingsCompleted atomic.Int64
+	TotalConnections  atomic.Int64
+}
+
+// Stats holds a snapshot of server metrics.
+type Stats struct {
+	Uptime            string `json:"uptime"`
+	UptimeSeconds     int64  `json:"uptime_seconds"`
+	Connections       int    `json:"connections"`
+	Channels          int    `json:"channels"`
+	ChannelsWaiting   int    `json:"channels_waiting"`
+	ChannelsChallenging int  `json:"channels_challenging"`
+	ChannelsActive    int    `json:"channels_active"`
+	WaitingPairings   int    `json:"waiting_pairings"`
+	MessagesRelayed   int64  `json:"messages_relayed"`
+	PairingsCompleted int64  `json:"pairings_completed"`
+	TotalConnections  int64  `json:"total_connections"`
+	BytesIn           int64  `json:"bytes_in"`
+	BytesOut          int64  `json:"bytes_out"`
+}
+
+// Stats returns a snapshot of current server metrics.
+func (b *Bridge) Stats() Stats {
+	b.mu.Lock()
+	conns := len(b.connections)
+	chTotal := len(b.channels)
+	waiting := len(b.waitingPeers)
+	var chWaiting, chChallenging, chActive int
+	for _, ch := range b.channels {
+		ch.mu.Lock()
+		switch ch.State {
+		case StateWaitPeer:
+			chWaiting++
+		case StateChallenging:
+			chChallenging++
+		case StateActive:
+			chActive++
+		}
+		ch.mu.Unlock()
+	}
+	b.mu.Unlock()
+
+	uptime := time.Since(b.startTime)
+	return Stats{
+		Uptime:            uptime.Truncate(time.Second).String(),
+		UptimeSeconds:     int64(uptime.Seconds()),
+		Connections:       conns,
+		Channels:          chTotal,
+		ChannelsWaiting:   chWaiting,
+		ChannelsChallenging: chChallenging,
+		ChannelsActive:    chActive,
+		WaitingPairings:   waiting,
+		MessagesRelayed:   b.MessagesRelayed.Load(),
+		PairingsCompleted: b.PairingsCompleted.Load(),
+		TotalConnections:  b.TotalConnections.Load(),
+		BytesIn:           b.BytesIn.Load(),
+		BytesOut:          b.BytesOut.Load(),
+	}
 }
 
 // NewBridge creates a new Bridge instance.
@@ -67,6 +132,7 @@ func NewBridge(cfg BridgeConfig) *Bridge {
 		pairRate:     NewRateLimiter(pairLimit, 10*time.Minute),
 		channelRate:  NewRateLimiter(chanLimit, 10*time.Minute),
 		stop:         make(chan struct{}),
+		startTime:    time.Now(),
 	}
 	go b.cleanupLoop()
 	return b
@@ -124,6 +190,7 @@ func (b *Bridge) RegisterConn(conn *Connection) {
 	b.mu.Lock()
 	b.connections[conn] = true
 	b.mu.Unlock()
+	b.TotalConnections.Add(1)
 }
 
 // UnregisterConn removes a connection and cleans up all its state.
@@ -237,6 +304,8 @@ func (b *Bridge) handlePair(conn *Connection, msg InMsg) {
 
 	delete(b.waitingPeers, msg.Ch)
 	b.mu.Unlock()
+
+	b.PairingsCompleted.Add(1)
 
 	sendMsg(initiatorConn, OutMsg{
 		Type:     "pair_matched",
@@ -494,6 +563,8 @@ func (b *Bridge) handleRelay(conn *Connection, msg InMsg) {
 		return // fire-and-forget
 	}
 
+	b.MessagesRelayed.Add(1)
+
 	sendMsg(ch.Peers[otherIdx].Conn, OutMsg{
 		Type:   "message",
 		Ch:     msg.Ch,
@@ -710,5 +781,7 @@ func sendMsg(conn *Connection, msg OutMsg) {
 	if err != nil {
 		return
 	}
-	conn.Conn.Write(ctx, websocket.MessageText, data)
+	if err := conn.Conn.Write(ctx, websocket.MessageText, data); err == nil && conn.bytesOut != nil {
+		conn.bytesOut.Add(int64(len(data)))
+	}
 }

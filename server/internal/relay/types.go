@@ -2,6 +2,7 @@ package relay
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -35,6 +36,7 @@ type Connection struct {
 	IP       string // originating IP address
 	Channels map[string]bool // channelIds this connection has joined
 	mu       sync.Mutex
+	bytesOut *atomic.Int64 // shared counter for bytes sent
 }
 
 // WaitingPeer stores a peer waiting for pairing match.
