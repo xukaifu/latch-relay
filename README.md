@@ -27,8 +27,8 @@ Environment variables:
 |----------|---------|-------------|
 | `PORT` | `8081` | Listen port |
 | `MAX_CHANNELS` | `10000` | Global channel cap |
-| `MAX_PAIRINGS_PER_IP` | `20` | Max pairings per IP per minute |
-| `MAX_CHANNELS_PER_IP` | `10` | Max channels per IP per minute |
+| `MAX_PAIRINGS_PER_IP` | `60` | Max pairings per IP per minute |
+| `MAX_CHANNELS_PER_IP` | `30` | Max channels per IP per minute |
 | `TRUST_PROXY` | `false` | Trust X-Forwarded-For / X-Real-IP headers (`true` or `1`) |
 | `DEBUG` | `false` | Enable debug logging for connections, pairing, relay (`true` or `1`) |
 
@@ -557,13 +557,13 @@ MaxPeersPerChannel  = 2        // 1:1 channels, at most 2 peers
 MaxChannelsTotal    = 10000    // global channel cap (configurable)
 PairingTTL          = 10min    // waiting peer expiration (deleted on successful pairing)
 IdleTimeout         = 60s      // close connection if no activity
-MaxMessageSize      = 256KB    // reject oversized WebSocket messages
+MaxMessageSize      = 20MB     // reject oversized WebSocket messages
 ChallengeTimeout    = 10s      // challenge response deadline
 WaitPeerTimeout     = 30s      // WAIT_PEER state expiration
 
 // Per-IP rate limits (per window)
-MaxPairingsPerIP    = 20/min   // pairing attempts from same IP
-MaxChannelsPerIP    = 10/min   // channel joins from same IP
+MaxPairingsPerIP    = 60/min   // pairing attempts from same IP
+MaxChannelsPerIP    = 30/min   // channel joins from same IP
 MaxConnectionRate   = 10/s     // new connections per second from same IP
 MaxJoinsPerChannel  = 3/10s   // join attempts per channelId (mitigates replacement DoS)
 ```

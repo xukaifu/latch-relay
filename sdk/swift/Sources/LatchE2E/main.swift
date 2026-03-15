@@ -83,7 +83,7 @@ func run() async throws {
         receivedSemaphore.wait()
         // Small delay to ensure stdout is flushed
         try await Task.sleep(for: .milliseconds(100))
-        client.close()
+        await client.close()
         exit(0)
     }
 
@@ -91,7 +91,7 @@ func run() async throws {
     fputs("Listening for messages...\n", stderr)
     try await Task.sleep(for: .seconds(300))
 
-    client.close()
+    await client.close()
 }
 
 Task {

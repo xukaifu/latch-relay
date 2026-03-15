@@ -130,11 +130,11 @@ func (b *Bridge) debugf(format string, args ...any) {
 func NewBridge(cfg BridgeConfig) *Bridge {
 	pairLimit := cfg.MaxPairingsPerIP
 	if pairLimit <= 0 {
-		pairLimit = 20
+		pairLimit = 60
 	}
 	chanLimit := cfg.MaxChannelsPerIP
 	if chanLimit <= 0 {
-		chanLimit = 10
+		chanLimit = 30
 	}
 	b := &Bridge{
 		waitingPeers: make(map[string]*WaitingPeer),
@@ -611,8 +611,16 @@ func (b *Bridge) handleLeave(conn *Connection, msg InMsg) {
 	ch.mu.Lock()
 	b.mu.Unlock()
 
-	b.removePeerFromChannelLocked(ch, msg.Ch, conn, false)
+	empty := b.removePeerFromChannelLocked(ch, msg.Ch, conn, false)
 	ch.mu.Unlock()
+
+	if empty {
+		b.mu.Lock()
+		if b.channels[msg.Ch] == ch {
+			delete(b.channels, msg.Ch)
+		}
+		b.mu.Unlock()
+	}
 
 	conn.mu.Lock()
 	delete(conn.Channels, msg.Ch)
@@ -660,9 +668,12 @@ func (b *Bridge) handleVerifyRejected(conn *Connection, msg InMsg) {
 	}
 }
 
-// removePeerFromChannelLocked removes a peer from a channel. ch.mu must be held.
-// If holdingBridgeMu is true, the caller already holds b.mu.
-func (b *Bridge) removePeerFromChannelLocked(ch *Channel, chID string, conn *Connection, holdingBridgeMu bool) {
+// removePeerFromChannelLocked removes a peer from a channel.
+// ch.mu must be held. If holdingBridgeMu is true, the caller already holds b.mu.
+// Returns true if the channel is now empty and should be deleted from b.channels.
+// When holdingBridgeMu is true, the deletion is done inline.
+// When holdingBridgeMu is false, the caller must delete after releasing ch.mu.
+func (b *Bridge) removePeerFromChannelLocked(ch *Channel, chID string, conn *Connection, holdingBridgeMu bool) (empty bool) {
 	removedIdx := -1
 	removedID := ""
 	for i, peer := range ch.Peers {
@@ -675,7 +686,7 @@ func (b *Bridge) removePeerFromChannelLocked(ch *Channel, chID string, conn *Con
 	}
 
 	if removedIdx == -1 {
-		return // silently skip (handles races)
+		return false
 	}
 
 	var remaining *ChannelMember
@@ -688,12 +699,8 @@ func (b *Bridge) removePeerFromChannelLocked(ch *Channel, chID string, conn *Con
 	if remaining == nil {
 		if holdingBridgeMu {
 			delete(b.channels, chID)
-		} else {
-			b.mu.Lock()
-			delete(b.channels, chID)
-			b.mu.Unlock()
 		}
-		return
+		return !holdingBridgeMu // caller must delete if we didn't
 	}
 
 	// Other peer remains: transition to WAIT_PEER, clear challenge data
@@ -706,6 +713,7 @@ func (b *Bridge) removePeerFromChannelLocked(ch *Channel, chID string, conn *Con
 	sendMsg(remaining.Conn, OutMsg{Type: "peer_left", Ch: chID, PeerID: removedID})
 
 	go b.waitPeerTimeout(chID, gen)
+	return false
 }
 
 func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
@@ -725,8 +733,8 @@ func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
 	}
 	ch.mu.Lock()
 	b.mu.Unlock()
-	defer ch.mu.Unlock()
 
+	shouldDelete := false
 	for i, peer := range ch.Peers {
 		if peer != nil && peer.Conn == conn && peer.Response == nil {
 			b.debugf("challenge_timeout ch=%s id=%s", chID[:min(16, len(chID))], peer.ID)
@@ -743,16 +751,23 @@ func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
 				}
 			}
 			if remaining == nil {
-				b.mu.Lock()
-				delete(b.channels, chID)
-				b.mu.Unlock()
+				shouldDelete = true
 			} else {
 				ch.State = StateWaitPeer
 				remaining.Nonce = nil
 				remaining.Response = nil
 			}
-			return
+			break
 		}
+	}
+	ch.mu.Unlock()
+
+	if shouldDelete {
+		b.mu.Lock()
+		if b.channels[chID] == ch {
+			delete(b.channels, chID)
+		}
+		b.mu.Unlock()
 	}
 }
 
@@ -773,25 +788,29 @@ func (b *Bridge) waitPeerTimeout(chID string, gen uint64) {
 	}
 	ch.mu.Lock()
 	b.mu.Unlock()
-	defer ch.mu.Unlock()
 
-	if ch.State != StateWaitPeer || ch.WaitGen != gen {
-		return // stale timeout
-	}
-
-	for i, peer := range ch.Peers {
-		if peer != nil {
-			sendMsg(peer.Conn, OutMsg{Type: "error", Code: ErrChallengeTimeout, Ch: chID})
-			peer.Conn.mu.Lock()
-			delete(peer.Conn.Channels, chID)
-			peer.Conn.mu.Unlock()
-			ch.Peers[i] = nil
+	shouldDelete := false
+	if ch.State == StateWaitPeer && ch.WaitGen == gen {
+		for i, peer := range ch.Peers {
+			if peer != nil {
+				sendMsg(peer.Conn, OutMsg{Type: "error", Code: ErrChallengeTimeout, Ch: chID})
+				peer.Conn.mu.Lock()
+				delete(peer.Conn.Channels, chID)
+				peer.Conn.mu.Unlock()
+				ch.Peers[i] = nil
+			}
 		}
+		shouldDelete = true
 	}
+	ch.mu.Unlock()
 
-	b.mu.Lock()
-	delete(b.channels, chID)
-	b.mu.Unlock()
+	if shouldDelete {
+		b.mu.Lock()
+		if b.channels[chID] == ch {
+			delete(b.channels, chID)
+		}
+		b.mu.Unlock()
+	}
 }
 
 // sendMsg writes a JSON message to a connection. Fire-and-forget.

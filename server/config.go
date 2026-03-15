@@ -24,7 +24,7 @@ func LoadConfig() Config {
 	c := Config{
 		Port:             "8081",
 		MaxChannelsTotal: 10000,
-		MaxMessageSize:   256 * 1024,
+		MaxMessageSize:   20 * 1024 * 1024,
 		PairingTTL:       10 * time.Minute,
 		IdleTimeout:      60 * time.Second,
 		ChallengeTimeout: 10 * time.Second,

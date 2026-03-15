@@ -340,9 +340,11 @@ public class LatchClient {
     }
 
     /// Close the WebSocket connection.
-    public func close() {
+    /// Waits for the receive loop to exit, ensuring the connection is fully closed.
+    public func close() async {
         receiveTask?.cancel()
         webSocket?.cancel(with: .normalClosure, reason: nil)
+        await receiveTask?.value
         webSocket = nil
     }
 

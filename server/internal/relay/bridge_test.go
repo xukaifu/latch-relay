@@ -794,6 +794,7 @@ func TestMaxPairingsPerIPRateLimit(t *testing.T) {
 		IdleTimeout:      60 * time.Second,
 		ChallengeTimeout: 10 * time.Second,
 		WaitPeerTimeout:  30 * time.Second,
+		MaxPairingsPerIP: 5,
 	})
 	t.Cleanup(b.Close)
 	s := testServer(b)
@@ -833,6 +834,7 @@ func TestMaxChannelsPerIPRateLimit(t *testing.T) {
 		IdleTimeout:      60 * time.Second,
 		ChallengeTimeout: 10 * time.Second,
 		WaitPeerTimeout:  30 * time.Second,
+		MaxChannelsPerIP: 20,
 	})
 	t.Cleanup(b.Close)
 	s := testServer(b)
