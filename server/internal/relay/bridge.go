@@ -130,7 +130,7 @@ func (b *Bridge) debugf(format string, args ...any) {
 func NewBridge(cfg BridgeConfig) *Bridge {
 	pairLimit := cfg.MaxPairingsPerIP
 	if pairLimit <= 0 {
-		pairLimit = 5
+		pairLimit = 20
 	}
 	chanLimit := cfg.MaxChannelsPerIP
 	if chanLimit <= 0 {

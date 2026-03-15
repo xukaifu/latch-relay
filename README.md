@@ -27,8 +27,10 @@ Environment variables:
 |----------|---------|-------------|
 | `PORT` | `8081` | Listen port |
 | `MAX_CHANNELS` | `10000` | Global channel cap |
-| `MAX_PAIRINGS_PER_IP` | `5` | Max concurrent pairings per IP |
-| `MAX_CHANNELS_PER_IP` | `20` | Max channels per IP |
+| `MAX_PAIRINGS_PER_IP` | `20` | Max pairings per IP per minute |
+| `MAX_CHANNELS_PER_IP` | `10` | Max channels per IP per minute |
+| `TRUST_PROXY` | `false` | Trust X-Forwarded-For / X-Real-IP headers (`true` or `1`) |
+| `DEBUG` | `false` | Enable debug logging for connections, pairing, relay (`true` or `1`) |
 
 Pre-built binaries for Linux/macOS/Windows (amd64/arm64) are available on [GitHub Releases](https://github.com/xukaifu/latch-relay/releases).
 
@@ -559,9 +561,9 @@ MaxMessageSize      = 256KB    // reject oversized WebSocket messages
 ChallengeTimeout    = 10s      // challenge response deadline
 WaitPeerTimeout     = 30s      // WAIT_PEER state expiration
 
-// Per-IP rate limits
-MaxPairingsPerIP    = 5        // concurrent waiting peers from same IP
-MaxChannelsPerIP    = 20       // channels from same IP
+// Per-IP rate limits (per window)
+MaxPairingsPerIP    = 20/min   // pairing attempts from same IP
+MaxChannelsPerIP    = 10/min   // channel joins from same IP
 MaxConnectionRate   = 10/s     // new connections per second from same IP
 MaxJoinsPerChannel  = 3/10s   // join attempts per channelId (mitigates replacement DoS)
 ```
@@ -596,6 +598,7 @@ Reference implementations:
 
 ```
 GET  /healthz       -> health check
+GET  /monitor       -> runtime metrics (JSON: uptime, connections, channels, bytes, etc.)
 WS   /v1/connect    -> single endpoint for pairing + relay
 ```
 
