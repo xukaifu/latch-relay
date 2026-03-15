@@ -90,8 +90,21 @@ public class LatchClient {
             connectURL = wsURL.appendingPathComponent("v1/connect")
         }
 
-        webSocket = session.webSocketTask(with: connectURL)
-        webSocket?.resume()
+        let ws = session.webSocketTask(with: connectURL)
+        webSocket = ws
+        ws.resume()
+
+        // Wait for the WebSocket handshake to complete before returning.
+        // sendPing succeeds only after the connection is fully open.
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            ws.sendPing { error in
+                if let error = error {
+                    cont.resume(throwing: error)
+                } else {
+                    cont.resume()
+                }
+            }
+        }
 
         receiveTask = Task { [weak self] in
             await self?.receiveLoop()
@@ -124,18 +137,20 @@ public class LatchClient {
         )
         try await sendJSON(pairMsg)
 
-        // Wait for pair_matched
-        let matched: InMsg = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { cont in
+        // Wait for pair_matched (10 min — matches pairing code validity window)
+        let matched: InMsg = try await withTimeout(seconds: 600) {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { cont in
+                    self.lock.lock()
+                    self.pairContinuations[pairingId] = cont
+                    self.lock.unlock()
+                }
+            } onCancel: {
                 self.lock.lock()
-                self.pairContinuations[pairingId] = cont
+                let cont = self.pairContinuations.removeValue(forKey: pairingId)
                 self.lock.unlock()
+                cont?.resume(throwing: CancellationError())
             }
-        } onCancel: {
-            self.lock.lock()
-            let cont = self.pairContinuations.removeValue(forKey: pairingId)
-            self.lock.unlock()
-            cont?.resume(throwing: CancellationError())
         }
 
         guard matched.type == "pair_matched" else {

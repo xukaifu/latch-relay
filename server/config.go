@@ -17,6 +17,7 @@ type Config struct {
 	MaxPairingsPerIP int
 	MaxChannelsPerIP int
 	TrustProxy       bool
+	Debug            bool
 }
 
 func LoadConfig() Config {
@@ -43,6 +44,9 @@ func LoadConfig() Config {
 	}
 	if os.Getenv("TRUST_PROXY") == "true" || os.Getenv("TRUST_PROXY") == "1" {
 		c.TrustProxy = true
+	}
+	if os.Getenv("DEBUG") == "true" || os.Getenv("DEBUG") == "1" {
+		c.Debug = true
 	}
 	return c
 }

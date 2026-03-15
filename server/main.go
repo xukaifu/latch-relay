@@ -24,6 +24,7 @@ func main() {
 		WaitPeerTimeout:  cfg.WaitPeerTimeout,
 		MaxPairingsPerIP: cfg.MaxPairingsPerIP,
 		MaxChannelsPerIP: cfg.MaxChannelsPerIP,
+		Debug:            cfg.Debug,
 	})
 
 	mux := http.NewServeMux()
@@ -56,6 +57,9 @@ func main() {
 		}
 	}()
 
+	if cfg.Debug {
+		log.Println("debug mode enabled")
+	}
 	log.Printf("latch-relay listening on :%s", cfg.Port)
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatal(err)

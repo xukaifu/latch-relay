@@ -32,6 +32,7 @@ type BridgeConfig struct {
 	WaitPeerTimeout   time.Duration
 	MaxPairingsPerIP  int // 0 = default (5)
 	MaxChannelsPerIP  int // 0 = default (20)
+	Debug             bool
 }
 
 // Bridge is the central relay server state.
@@ -79,8 +80,16 @@ func (b *Bridge) Stats() Stats {
 	conns := len(b.connections)
 	chTotal := len(b.channels)
 	waiting := len(b.waitingPeers)
-	var chWaiting, chChallenging, chActive int
+	// Snapshot channel pointers under b.mu, then release before locking
+	// individual channels to avoid AB-BA deadlock with removePeerFromChannelLocked.
+	channels := make([]*Channel, 0, chTotal)
 	for _, ch := range b.channels {
+		channels = append(channels, ch)
+	}
+	b.mu.Unlock()
+
+	var chWaiting, chChallenging, chActive int
+	for _, ch := range channels {
 		ch.mu.Lock()
 		switch ch.State {
 		case StateWaitPeer:
@@ -92,7 +101,6 @@ func (b *Bridge) Stats() Stats {
 		}
 		ch.mu.Unlock()
 	}
-	b.mu.Unlock()
 
 	uptime := time.Since(b.startTime)
 	return Stats{
@@ -112,6 +120,12 @@ func (b *Bridge) Stats() Stats {
 	}
 }
 
+func (b *Bridge) debugf(format string, args ...any) {
+	if b.cfg.Debug {
+		log.Printf("[DEBUG] "+format, args...)
+	}
+}
+
 // NewBridge creates a new Bridge instance.
 func NewBridge(cfg BridgeConfig) *Bridge {
 	pairLimit := cfg.MaxPairingsPerIP
@@ -120,7 +134,7 @@ func NewBridge(cfg BridgeConfig) *Bridge {
 	}
 	chanLimit := cfg.MaxChannelsPerIP
 	if chanLimit <= 0 {
-		chanLimit = 20
+		chanLimit = 10
 	}
 	b := &Bridge{
 		waitingPeers: make(map[string]*WaitingPeer),
@@ -129,8 +143,8 @@ func NewBridge(cfg BridgeConfig) *Bridge {
 		cfg:          cfg,
 		connRate:     NewRateLimiter(10, time.Second),
 		joinRate:     NewRateLimiter(3, 10*time.Second),
-		pairRate:     NewRateLimiter(pairLimit, 10*time.Minute),
-		channelRate:  NewRateLimiter(chanLimit, 10*time.Minute),
+		pairRate:     NewRateLimiter(pairLimit, time.Minute),
+		channelRate:  NewRateLimiter(chanLimit, time.Minute),
 		stop:         make(chan struct{}),
 		startTime:    time.Now(),
 	}
@@ -191,10 +205,12 @@ func (b *Bridge) RegisterConn(conn *Connection) {
 	b.connections[conn] = true
 	b.mu.Unlock()
 	b.TotalConnections.Add(1)
+	b.debugf("conn+ ip=%s", conn.IP)
 }
 
 // UnregisterConn removes a connection and cleans up all its state.
 func (b *Bridge) UnregisterConn(conn *Connection) {
+	b.debugf("conn- ip=%s id=%s", conn.IP, conn.ID)
 	// Collect channel IDs under conn.mu first, then release it before
 	// acquiring higher-level locks. This preserves the documented lock
 	// ordering: Bridge.mu > Channel.mu > Connection.mu.
@@ -268,6 +284,7 @@ func (b *Bridge) handlePair(conn *Connection, msg InMsg) {
 	}
 
 	if !b.pairRate.Allow(conn.IP) {
+		b.debugf("rate_limited type=pair ip=%s", conn.IP)
 		sendMsg(conn, OutMsg{Type: "error", Code: ErrRateLimited, Ch: msg.Ch, Message: "pairing rate exceeded"})
 		return
 	}
@@ -277,6 +294,7 @@ func (b *Bridge) handlePair(conn *Connection, msg InMsg) {
 	wp, exists := b.waitingPeers[msg.Ch]
 	if !exists {
 		// First peer: store as waiting
+		b.debugf("pair wait ch=%s id=%s ip=%s", msg.Ch[:min(16, len(msg.Ch))], msg.ID, conn.IP)
 		b.waitingPeers[msg.Ch] = &WaitingPeer{
 			Conn:     conn,
 			ID:       msg.ID,
@@ -306,6 +324,7 @@ func (b *Bridge) handlePair(conn *Connection, msg InMsg) {
 	b.mu.Unlock()
 
 	b.PairingsCompleted.Add(1)
+	b.debugf("pair matched ch=%s initiator=%s responder=%s", msg.Ch[:min(16, len(msg.Ch))], initiatorID, responderID)
 
 	sendMsg(initiatorConn, OutMsg{
 		Type:     "pair_matched",
@@ -325,6 +344,7 @@ func (b *Bridge) handlePair(conn *Connection, msg InMsg) {
 }
 
 func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
+	b.debugf("join ch=%s id=%s ip=%s", msg.Ch[:min(16, len(msg.Ch))], msg.ID, conn.IP)
 	if msg.Ch == "" || msg.ID == "" {
 		sendMsg(conn, OutMsg{Type: "error", Code: ErrInvalidMessage, Message: "join requires ch, id"})
 		return
@@ -499,6 +519,7 @@ func (b *Bridge) handleResponse(conn *Connection, msg InMsg) {
 	}
 
 	// Both responded: send verify_peer to each
+	b.debugf("verified ch=%s peer0=%s peer1=%s", msg.Ch[:min(16, len(msg.Ch))], ch.Peers[0].ID, ch.Peers[1].ID)
 	for i := 0; i < 2; i++ {
 		other := 1 - i
 		sendMsg(ch.Peers[i].Conn, OutMsg{
@@ -564,6 +585,7 @@ func (b *Bridge) handleRelay(conn *Connection, msg InMsg) {
 	}
 
 	b.MessagesRelayed.Add(1)
+	b.debugf("relay ch=%s from=%s to=%s bytes=%d", msg.Ch[:min(16, len(msg.Ch))], ch.Peers[senderIdx].ID, ch.Peers[otherIdx].ID, len(msg.Data))
 
 	sendMsg(ch.Peers[otherIdx].Conn, OutMsg{
 		Type:   "message",
@@ -574,6 +596,7 @@ func (b *Bridge) handleRelay(conn *Connection, msg InMsg) {
 }
 
 func (b *Bridge) handleLeave(conn *Connection, msg InMsg) {
+	b.debugf("leave ch=%s id=%s", msg.Ch[:min(16, len(msg.Ch))], conn.ID)
 	if msg.Ch == "" {
 		sendMsg(conn, OutMsg{Type: "error", Code: ErrInvalidMessage, Message: "leave requires ch"})
 		return
@@ -706,6 +729,7 @@ func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
 
 	for i, peer := range ch.Peers {
 		if peer != nil && peer.Conn == conn && peer.Response == nil {
+			b.debugf("challenge_timeout ch=%s id=%s", chID[:min(16, len(chID))], peer.ID)
 			sendMsg(conn, OutMsg{Type: "error", Code: ErrChallengeTimeout, Ch: chID})
 			ch.Peers[i] = nil
 			conn.mu.Lock()
