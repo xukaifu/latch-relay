@@ -661,7 +661,7 @@ enum SPAKE2Constants {
 
 // MARK: - SPAKE2 Protocol
 
-public enum LatchRelayError: Error {
+public enum LatchRelayError: Error, LocalizedError {
     case invalidPoint
     case invalidPubShare
     case pairingFailed(String)
@@ -669,6 +669,18 @@ public enum LatchRelayError: Error {
     case connectionClosed
     case timeout
     case verifyRejected
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidPoint: return "Invalid elliptic curve point"
+        case .invalidPubShare: return "Invalid public share"
+        case .pairingFailed(let msg): return "Pairing failed: \(msg)"
+        case .channelError(let msg): return "Channel error: \(msg)"
+        case .connectionClosed: return "Connection closed"
+        case .timeout: return "Operation timed out"
+        case .verifyRejected: return "Peer verification rejected"
+        }
+    }
 }
 
 /// SPAKE2 key agreement result
