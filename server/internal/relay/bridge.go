@@ -153,7 +153,9 @@ func NewBridge(cfg BridgeConfig) *Bridge {
 		stop:         make(chan struct{}),
 		startTime:    time.Now(),
 	}
-	b.backend.Subscribe(b.handleRemoteMsg)
+	if err := b.backend.Subscribe(b.handleRemoteMsg); err != nil {
+		log.Printf("backend subscribe error: %v", err)
+	}
 	go b.cleanupLoop()
 	return b
 }
@@ -215,19 +217,32 @@ func (b *Bridge) UnregisterConn(conn *Connection) {
 
 	b.mu.Lock()
 
-	// Remove from channels
+	// Remove from channels, collect deleted channel IDs for backend cleanup
+	var deletedChannels []string
 	for chID := range channelsCopy {
 		ch, ok := b.channels[chID]
 		if !ok {
 			continue
 		}
 		ch.mu.Lock()
-		b.removePeerFromChannelLocked(ch, chID, conn, true)
+		empty := b.removePeerFromChannelLocked(ch, chID, conn, true)
 		ch.mu.Unlock()
+		if empty {
+			// removePeerFromChannelLocked already deleted from b.channels when holdingBridgeMu=true
+			// but it returns false in that case, so check if channel was actually deleted
+		}
+		// Check if channel was deleted (no longer in map)
+		if _, stillExists := b.channels[chID]; !stillExists {
+			deletedChannels = append(deletedChannels, chID)
+		}
 	}
 
 	delete(b.connections, conn)
 	b.mu.Unlock()
+
+	for _, chID := range deletedChannels {
+		b.backend.UnregisterChannelPeer(chID)
+	}
 }
 
 // HandleMessage dispatches an incoming message.
@@ -364,9 +379,13 @@ func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
 	b.mu.Unlock()
 	defer ch.mu.Unlock()
 
-	// Check for connection replacement
+	// Check for connection replacement (skip remote stubs)
 	for i, peer := range ch.Peers {
 		if peer != nil && peer.ID == msg.ID {
+			if peer.Remote || peer.Conn == nil {
+				ch.Peers[i] = nil
+				continue
+			}
 			sendMsg(peer.Conn, OutMsg{Type: "error", Code: ErrReplaced, Ch: msg.Ch})
 			peer.Conn.mu.Lock()
 			delete(peer.Conn.Channels, msg.Ch)
@@ -662,6 +681,7 @@ func (b *Bridge) handleLeave(conn *Connection, msg InMsg) {
 			delete(b.channels, msg.Ch)
 		}
 		b.mu.Unlock()
+		b.backend.UnregisterChannelPeer(msg.Ch)
 	}
 
 	conn.mu.Lock()
@@ -704,6 +724,8 @@ func (b *Bridge) handleVerifyRejected(conn *Connection, msg InMsg) {
 	delete(b.channels, msg.Ch)
 	ch.mu.Unlock()
 	b.mu.Unlock()
+
+	b.backend.UnregisterChannelPeer(msg.Ch)
 
 	if toNotify != nil {
 		sendMsg(toNotify, OutMsg{Type: "error", Code: ErrVerifyRejected, Ch: msg.Ch})
@@ -806,8 +828,10 @@ func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
 				shouldDelete = true
 			} else {
 				ch.State = StateWaitPeer
+				ch.WaitGen++
 				remaining.Nonce = nil
 				remaining.Response = nil
+				go b.waitPeerTimeout(chID, ch.WaitGen)
 			}
 			break
 		}
@@ -820,6 +844,7 @@ func (b *Bridge) challengeTimeout(chID string, conn *Connection) {
 			delete(b.channels, chID)
 		}
 		b.mu.Unlock()
+		b.backend.UnregisterChannelPeer(chID)
 	}
 }
 
@@ -867,6 +892,7 @@ func (b *Bridge) waitPeerTimeout(chID string, gen uint64) {
 			delete(b.channels, chID)
 		}
 		b.mu.Unlock()
+		b.backend.UnregisterChannelPeer(chID)
 	}
 }
 
@@ -1042,7 +1068,9 @@ func (b *Bridge) handleRemoteJoinNotify(channelId string, jn RemoteJoinNotify) {
 					Reply:  true,
 				})
 				if err == nil {
-					b.backend.Publish(channelId, data)
+					if pubErr := b.backend.Publish(channelId, data); pubErr != nil {
+						log.Printf("publish join_notify reply: %v", pubErr)
+					}
 				}
 			}
 		}
@@ -1122,19 +1150,39 @@ func (b *Bridge) handleRemotePeerLeft(channelId string, pl RemotePeerLeft) {
 	if !exists {
 		return
 	}
-	defer ch.mu.Unlock()
 
+	shouldDelete := false
 	for i, peer := range ch.Peers {
 		if peer != nil && peer.Remote && peer.ID == pl.PeerID {
 			ch.Peers[i] = nil
 
-			// Notify local peer
-			for _, local := range ch.Peers {
-				if local != nil && !local.Remote && local.Conn != nil {
-					sendMsg(local.Conn, OutMsg{Type: "peer_left", Ch: channelId, PeerID: pl.PeerID})
+			// Check if any peer remains
+			var remaining *ChannelMember
+			for _, p := range ch.Peers {
+				if p != nil {
+					remaining = p
 				}
+			}
+
+			if remaining == nil {
+				shouldDelete = true
+			} else if !remaining.Remote && remaining.Conn != nil {
+				sendMsg(remaining.Conn, OutMsg{Type: "peer_left", Ch: channelId, PeerID: pl.PeerID})
+				ch.State = StateWaitPeer
+				ch.WaitGen++
+				go b.waitPeerTimeout(channelId, ch.WaitGen)
 			}
 			break
 		}
+	}
+	ch.mu.Unlock()
+
+	if shouldDelete {
+		b.mu.Lock()
+		if b.channels[channelId] == ch {
+			delete(b.channels, channelId)
+		}
+		b.mu.Unlock()
+		b.backend.UnregisterChannelPeer(channelId)
 	}
 }

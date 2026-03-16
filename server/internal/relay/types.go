@@ -3,7 +3,6 @@ package relay
 import (
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"nhooyr.io/websocket"
 )
@@ -39,13 +38,6 @@ type Connection struct {
 	bytesOut *atomic.Int64 // shared counter for bytes sent
 }
 
-// WaitingPeer stores a peer waiting for pairing match.
-type WaitingPeer struct {
-	Conn     *Connection
-	ID       string // id from the pair message (not conn.ID)
-	PubShare []byte
-	Created  time.Time
-}
 
 // ChannelMember represents one peer in a channel.
 type ChannelMember struct {
