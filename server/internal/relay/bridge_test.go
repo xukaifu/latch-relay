@@ -899,6 +899,485 @@ func TestWaitPeerTimeoutStaleGoroutine(t *testing.T) {
 	}
 }
 
+func TestStats(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	// Initial stats: zero connections, zero channels
+	st := b.Stats()
+	if st.Connections != 0 {
+		t.Fatalf("expected 0 connections, got %d", st.Connections)
+	}
+	if st.Channels != 0 {
+		t.Fatalf("expected 0 channels, got %d", st.Channels)
+	}
+
+	ws1 := dial(t, s)
+	defer ws1.Close(websocket.StatusNormalClosure, "")
+	ws2 := dial(t, s)
+	defer ws2.Close(websocket.StatusNormalClosure, "")
+
+	// After connecting, should have 2 connections
+	time.Sleep(50 * time.Millisecond)
+	st = b.Stats()
+	if st.Connections != 2 {
+		t.Fatalf("expected 2 connections, got %d", st.Connections)
+	}
+	if st.TotalConnections != 2 {
+		t.Fatalf("expected TotalConnections=2, got %d", st.TotalConnections)
+	}
+
+	// First peer joins -> channel in WAIT_PEER
+	send(t, ws1, InMsg{Type: "join", Ch: "stats-ch", ID: "peer-A"})
+	recv(t, ws1) // challenge
+
+	st = b.Stats()
+	if st.Channels != 1 {
+		t.Fatalf("expected 1 channel, got %d", st.Channels)
+	}
+	if st.ChannelsWaiting != 1 {
+		t.Fatalf("expected 1 waiting channel, got %d", st.ChannelsWaiting)
+	}
+
+	// Second peer joins -> channel in CHALLENGING
+	send(t, ws2, InMsg{Type: "join", Ch: "stats-ch", ID: "peer-B"})
+	recv(t, ws1) // re-challenge
+	recv(t, ws2) // challenge
+
+	st = b.Stats()
+	if st.ChannelsChallenging != 1 {
+		t.Fatalf("expected 1 challenging channel, got %d", st.ChannelsChallenging)
+	}
+
+	// Both respond -> ACTIVE
+	send(t, ws1, InMsg{Type: "response", Ch: "stats-ch", Mac: b64.EncodeToString([]byte("mac-A"))})
+	send(t, ws2, InMsg{Type: "response", Ch: "stats-ch", Mac: b64.EncodeToString([]byte("mac-B"))})
+	recv(t, ws1) // verify_peer
+	recv(t, ws2) // verify_peer
+
+	st = b.Stats()
+	if st.ChannelsActive != 1 {
+		t.Fatalf("expected 1 active channel, got %d", st.ChannelsActive)
+	}
+
+	// Relay a message and check counter
+	send(t, ws1, InMsg{Type: "message", Ch: "stats-ch", Data: b64.EncodeToString([]byte("hello"))})
+	recv(t, ws2)
+
+	st = b.Stats()
+	if st.MessagesRelayed != 1 {
+		t.Fatalf("expected MessagesRelayed=1, got %d", st.MessagesRelayed)
+	}
+	if st.UptimeSeconds < 0 {
+		t.Fatalf("expected non-negative uptime, got %d", st.UptimeSeconds)
+	}
+	if st.BytesIn <= 0 {
+		t.Fatalf("expected positive BytesIn, got %d", st.BytesIn)
+	}
+	if st.BytesOut <= 0 {
+		t.Fatalf("expected positive BytesOut, got %d", st.BytesOut)
+	}
+}
+
+func TestChallengeTimeoutRemovesPeer(t *testing.T) {
+	b := NewBridge(BridgeConfig{
+		MaxChannelsTotal: 100,
+		MaxMessageSize:   256 * 1024,
+		PairingTTL:       10 * time.Minute,
+		IdleTimeout:      60 * time.Second,
+		ChallengeTimeout: 200 * time.Millisecond,
+		WaitPeerTimeout:  30 * time.Second,
+	})
+	t.Cleanup(b.Close)
+	s := testServer(b)
+	defer s.Close()
+
+	ws1 := dial(t, s)
+	defer ws1.Close(websocket.StatusNormalClosure, "")
+	ws2 := dial(t, s)
+	defer ws2.Close(websocket.StatusNormalClosure, "")
+
+	// Both join so we enter CHALLENGING state
+	send(t, ws1, InMsg{Type: "join", Ch: "timeout-ch", ID: "peer-A"})
+	recv(t, ws1) // initial challenge
+
+	send(t, ws2, InMsg{Type: "join", Ch: "timeout-ch", ID: "peer-B"})
+	recv(t, ws1) // re-challenge
+	recv(t, ws2) // challenge
+
+	// Only peer-A responds; peer-B does NOT respond
+	send(t, ws1, InMsg{Type: "response", Ch: "timeout-ch", Mac: b64.EncodeToString([]byte("mac-A"))})
+
+	// Wait for challenge timeout to fire
+	time.Sleep(400 * time.Millisecond)
+
+	// Peer-B should receive challenge_timeout error
+	msg := tryRecv(t, ws2, 500*time.Millisecond)
+	if msg == nil {
+		t.Fatal("expected challenge_timeout error, got nothing")
+	}
+	if msg.Type != "error" || msg.Code != ErrChallengeTimeout {
+		t.Fatalf("expected challenge_timeout error, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestWaitPeerTimeoutCleansChannel(t *testing.T) {
+	b := NewBridge(BridgeConfig{
+		MaxChannelsTotal: 100,
+		MaxMessageSize:   256 * 1024,
+		PairingTTL:       10 * time.Minute,
+		IdleTimeout:      60 * time.Second,
+		ChallengeTimeout: 10 * time.Second,
+		WaitPeerTimeout:  200 * time.Millisecond,
+	})
+	t.Cleanup(b.Close)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	// One client joins, receives challenge, responds
+	send(t, ws, InMsg{Type: "join", Ch: "wait-ch", ID: "peer-A"})
+	recv(t, ws) // challenge
+
+	// No second client joins. Wait for timeout.
+	time.Sleep(400 * time.Millisecond)
+
+	// Client should receive challenge_timeout (the waitPeerTimeout sends this code)
+	msg := tryRecv(t, ws, 500*time.Millisecond)
+	if msg == nil {
+		t.Fatal("expected timeout error, got nothing")
+	}
+	if msg.Type != "error" || msg.Code != ErrChallengeTimeout {
+		t.Fatalf("expected challenge_timeout error, got type=%q code=%q", msg.Type, msg.Code)
+	}
+
+	// Channel should be cleaned up
+	time.Sleep(50 * time.Millisecond)
+	b.mu.Lock()
+	_, exists := b.channels["wait-ch"]
+	b.mu.Unlock()
+	if exists {
+		t.Fatal("expected channel to be deleted after wait peer timeout")
+	}
+}
+
+func TestHandleRemoteMsgDispatch(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	channelId := "remote-dispatch"
+
+	// Set up a channel with a local peer and a remote stub
+	send(t, ws, InMsg{Type: "join", Ch: channelId, ID: "local", Role: "initiator"})
+	recv(t, ws) // challenge
+
+	// Test join_notify via handleRemoteMsg
+	joinData, _ := marshalRemoteMsg("join_notify", channelId, RemoteJoinNotify{
+		PeerID: "remote",
+		Nonce:  []byte("nonce-for-remote-peer-0000000000"),
+	})
+	b.handleRemoteMsg(channelId, joinData)
+	reChallenge := recv(t, ws)
+	if reChallenge.Type != "challenge" {
+		t.Fatalf("join_notify dispatch: expected challenge, got %s", reChallenge.Type)
+	}
+
+	// Local responds
+	send(t, ws, InMsg{Type: "response", Ch: channelId, Mac: b64.EncodeToString([]byte("mac-local")), Role: "initiator"})
+
+	// Test response via handleRemoteMsg
+	respData, _ := marshalRemoteMsg("response", channelId, RemoteResponse{
+		PeerID:   "remote",
+		Role:     "responder",
+		Nonce:    []byte("nonce-for-remote-peer-0000000000"),
+		Response: []byte("mac-remote"),
+	})
+	b.handleRemoteMsg(channelId, respData)
+	vp := recv(t, ws)
+	if vp.Type != "verify_peer" {
+		t.Fatalf("response dispatch: expected verify_peer, got %s", vp.Type)
+	}
+
+	// Test relay via handleRemoteMsg
+	relayData, _ := marshalRemoteMsg("relay", channelId, RemoteRelay{
+		PeerID: "remote",
+		Data:   b64.EncodeToString([]byte("relayed-msg")),
+	})
+	b.handleRemoteMsg(channelId, relayData)
+	msg := recv(t, ws)
+	if msg.Type != "message" {
+		t.Fatalf("relay dispatch: expected message, got %s", msg.Type)
+	}
+
+	// Test peer_left via handleRemoteMsg
+	leftData, _ := marshalRemoteMsg("peer_left", channelId, RemotePeerLeft{PeerID: "remote"})
+	b.handleRemoteMsg(channelId, leftData)
+	pl := recv(t, ws)
+	if pl.Type != "peer_left" {
+		t.Fatalf("peer_left dispatch: expected peer_left, got %s", pl.Type)
+	}
+
+	// Test invalid JSON (should not panic)
+	b.handleRemoteMsg(channelId, []byte("invalid json"))
+
+	// Test pair_matched via handleRemoteMsg (no waiting peer, just tests dispatch)
+	pmData, _ := marshalRemoteMsg("pair_matched", "some-pairing", RemotePairMatched{
+		PairingID:    "some-pairing",
+		PeerID:       "someone",
+		PeerPubShare: []byte("share"),
+	})
+	b.handleRemoteMsg("some-pairing", pmData) // no-op, no waiting peer
+}
+
+func TestClientIPTrustProxy(t *testing.T) {
+	// Test with X-Forwarded-For
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "192.168.1.1:1234"
+	req.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
+	ip := clientIP(req, true)
+	if ip != "10.0.0.1" {
+		t.Fatalf("expected 10.0.0.1, got %q", ip)
+	}
+
+	// Test with X-Real-IP (no X-Forwarded-For)
+	req2, _ := http.NewRequest("GET", "/", nil)
+	req2.RemoteAddr = "192.168.1.1:1234"
+	req2.Header.Set("X-Real-IP", "10.0.0.3")
+	ip2 := clientIP(req2, true)
+	if ip2 != "10.0.0.3" {
+		t.Fatalf("expected 10.0.0.3, got %q", ip2)
+	}
+
+	// Test without trust proxy - should use RemoteAddr
+	ip3 := clientIP(req, false)
+	if ip3 != "192.168.1.1" {
+		t.Fatalf("expected 192.168.1.1, got %q", ip3)
+	}
+
+	// Test X-Forwarded-For single value
+	req4, _ := http.NewRequest("GET", "/", nil)
+	req4.RemoteAddr = "192.168.1.1:1234"
+	req4.Header.Set("X-Forwarded-For", "10.0.0.5")
+	ip4 := clientIP(req4, true)
+	if ip4 != "10.0.0.5" {
+		t.Fatalf("expected 10.0.0.5, got %q", ip4)
+	}
+}
+
+func TestLeaveNonexistentChannel(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	// Leave a channel that doesn't exist - should not error
+	send(t, ws, InMsg{Type: "leave", Ch: "nonexistent"})
+
+	// Leave with missing ch
+	send(t, ws, InMsg{Type: "leave"})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrInvalidMessage {
+		t.Fatalf("expected invalid_message error, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestResponseToNonexistentChannel(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	// Response to channel that doesn't exist
+	send(t, ws, InMsg{Type: "response", Ch: "nonexistent", Mac: b64.EncodeToString([]byte("mac"))})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrChannelNotFound {
+		t.Fatalf("expected channel_not_found, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestMessageToNonexistentChannel(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	// Message to channel that doesn't exist
+	send(t, ws, InMsg{Type: "message", Ch: "nonexistent", Data: b64.EncodeToString([]byte("data"))})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrChannelNotFound {
+		t.Fatalf("expected channel_not_found, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestPairInvalidPubShareEncoding(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	send(t, ws, InMsg{Type: "pair", Ch: "p1", PubShare: "!!!invalid-base64!!!", ID: "peer"})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrInvalidMessage {
+		t.Fatalf("expected invalid_message, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestResponseInvalidMacEncoding(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	send(t, ws, InMsg{Type: "join", Ch: "ch1", ID: "peer"})
+	recv(t, ws) // challenge
+
+	send(t, ws, InMsg{Type: "response", Ch: "ch1", Mac: "!!!invalid!!!"})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrInvalidMessage {
+		t.Fatalf("expected invalid_message, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestFieldTooLong(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	longCh := strings.Repeat("x", maxChLen+1)
+
+	// Pair with too-long ch
+	send(t, ws, InMsg{Type: "pair", Ch: longCh, PubShare: b64.EncodeToString([]byte("pub")), ID: "peer"})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrInvalidMessage {
+		t.Fatalf("expected invalid_message for long ch in pair, got type=%q code=%q", msg.Type, msg.Code)
+	}
+
+	// Join with too-long ch
+	send(t, ws, InMsg{Type: "join", Ch: longCh, ID: "peer"})
+	msg = recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrInvalidMessage {
+		t.Fatalf("expected invalid_message for long ch in join, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestMaxChannelsTotalLimit(t *testing.T) {
+	b := NewBridge(BridgeConfig{
+		MaxChannelsTotal: 2,
+		MaxMessageSize:   256 * 1024,
+		PairingTTL:       10 * time.Minute,
+		IdleTimeout:      60 * time.Second,
+		ChallengeTimeout: 10 * time.Second,
+		WaitPeerTimeout:  30 * time.Second,
+	})
+	t.Cleanup(b.Close)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	// Fill up channels
+	send(t, ws, InMsg{Type: "join", Ch: "ch1", ID: "p1"})
+	recv(t, ws) // challenge
+	send(t, ws, InMsg{Type: "join", Ch: "ch2", ID: "p2"})
+	recv(t, ws) // challenge
+
+	// Third should fail
+	send(t, ws, InMsg{Type: "join", Ch: "ch3", ID: "p3"})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrChannelFull {
+		t.Fatalf("expected channel_full, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestResponseNotInChannel(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws1 := dial(t, s)
+	defer ws1.Close(websocket.StatusNormalClosure, "")
+	ws2 := dial(t, s)
+	defer ws2.Close(websocket.StatusNormalClosure, "")
+
+	// ws1 joins
+	send(t, ws1, InMsg{Type: "join", Ch: "ch1", ID: "peer-A"})
+	recv(t, ws1) // challenge
+
+	// ws2 tries to respond to ch1 (not in channel)
+	send(t, ws2, InMsg{Type: "response", Ch: "ch1", Mac: b64.EncodeToString([]byte("mac"))})
+	msg := recv(t, ws2)
+	if msg.Type != "error" || msg.Code != ErrNotInChannel {
+		t.Fatalf("expected not_in_channel, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestResponseMissingFields(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	// Missing ch
+	send(t, ws, InMsg{Type: "response", Mac: b64.EncodeToString([]byte("mac"))})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrInvalidMessage {
+		t.Fatalf("expected invalid_message, got type=%q code=%q", msg.Type, msg.Code)
+	}
+
+	// Missing mac
+	send(t, ws, InMsg{Type: "response", Ch: "ch1"})
+	msg = recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrInvalidMessage {
+		t.Fatalf("expected invalid_message, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
+func TestMessageMissingFields(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	// Missing data
+	send(t, ws, InMsg{Type: "message", Ch: "ch1"})
+	msg := recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrInvalidMessage {
+		t.Fatalf("expected invalid_message, got type=%q code=%q", msg.Type, msg.Code)
+	}
+
+	// Missing ch
+	send(t, ws, InMsg{Type: "message", Data: "data"})
+	msg = recv(t, ws)
+	if msg.Type != "error" || msg.Code != ErrInvalidMessage {
+		t.Fatalf("expected invalid_message, got type=%q code=%q", msg.Type, msg.Code)
+	}
+}
+
 // setupActiveChannel sets up a fully active channel between two websockets.
 func setupActiveChannel(t *testing.T, ws1, ws2 *websocket.Conn, chID, id1, id2 string) {
 	t.Helper()

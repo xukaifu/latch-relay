@@ -120,6 +120,184 @@ func TestCrossNodePairing(t *testing.T) {
 	t.Logf("Cross-node pairing successful: A=%s B=%s", msgA.Role, msgB.Role)
 }
 
+// TestCrossNodeFullFlow tests the complete cross-node flow by directly exercising
+// the remote message handlers (handleRemoteJoinNotify, handleRemoteResponse,
+// handleRemoteRelay, handleRemotePeerLeft). This is a white-box test that sets up
+// channels with remote stubs to simulate cross-node communication.
+func TestCrossNodeFullFlow(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	channelId := "crossnode-full-flow"
+
+	// Local peer (Alice) joins
+	send(t, ws, InMsg{Type: "join", Ch: channelId, ID: "alice", Role: "initiator"})
+	challenge1 := recv(t, ws) // challenge (WAIT_PEER)
+	if challenge1.Type != "challenge" {
+		t.Fatalf("expected challenge, got %s", challenge1.Type)
+	}
+
+	// Simulate remote peer (Bob) joining via handleRemoteJoinNotify
+	remoteNonce := []byte("remote-nonce-for-bob-0000000000")
+	b.handleRemoteJoinNotify(channelId, RemoteJoinNotify{
+		PeerID: "bob",
+		Nonce:  remoteNonce,
+	})
+
+	// Alice should receive a re-challenge (fresh nonce)
+	reChallenge := recv(t, ws)
+	if reChallenge.Type != "challenge" {
+		t.Fatalf("expected re-challenge after remote join, got %s (code=%s)", reChallenge.Type, reChallenge.Code)
+	}
+
+	// Alice responds to the challenge
+	send(t, ws, InMsg{Type: "response", Ch: channelId, Mac: b64.EncodeToString([]byte("mac-alice")), Role: "initiator"})
+
+	// Simulate remote peer (Bob) responding via handleRemoteResponse
+	b.handleRemoteResponse(channelId, RemoteResponse{
+		PeerID:   "bob",
+		Role:     "responder",
+		Nonce:    remoteNonce,
+		Response: []byte("mac-bob"),
+	})
+
+	// Alice should receive verify_peer with Bob's data
+	vp := recv(t, ws)
+	if vp.Type != "verify_peer" {
+		t.Fatalf("expected verify_peer, got %s (code=%s)", vp.Type, vp.Code)
+	}
+	if vp.PeerID != "bob" {
+		t.Fatalf("expected peerId=bob, got %q", vp.PeerID)
+	}
+	if vp.PeerRole != "responder" {
+		t.Fatalf("expected peerRole=responder, got %q", vp.PeerRole)
+	}
+	vpMac, _ := b64.DecodeString(vp.PeerMac)
+	if string(vpMac) != "mac-bob" {
+		t.Fatalf("expected peerMac=mac-bob, got %q", string(vpMac))
+	}
+
+	// Channel should be ACTIVE now
+	b.mu.Lock()
+	ch := b.channels[channelId]
+	b.mu.Unlock()
+	ch.mu.Lock()
+	if ch.State != StateActive {
+		t.Fatalf("expected ACTIVE state, got %s", ch.State)
+	}
+	ch.mu.Unlock()
+
+	// Simulate remote peer sending a message via handleRemoteRelay
+	b.handleRemoteRelay(channelId, RemoteRelay{
+		PeerID: "bob",
+		Data:   b64.EncodeToString([]byte("hello-from-bob")),
+	})
+
+	// Alice should receive the relayed message
+	relayed := recv(t, ws)
+	if relayed.Type != "message" {
+		t.Fatalf("expected message, got %s", relayed.Type)
+	}
+	if relayed.PeerID != "bob" {
+		t.Fatalf("expected peerId=bob, got %q", relayed.PeerID)
+	}
+	relayedData, _ := b64.DecodeString(relayed.Data)
+	if string(relayedData) != "hello-from-bob" {
+		t.Fatalf("expected 'hello-from-bob', got %q", string(relayedData))
+	}
+
+	// Simulate remote peer leaving via handleRemotePeerLeft
+	b.handleRemotePeerLeft(channelId, RemotePeerLeft{PeerID: "bob"})
+
+	// Alice should receive peer_left
+	peerLeft := recv(t, ws)
+	if peerLeft.Type != "peer_left" {
+		t.Fatalf("expected peer_left, got %s", peerLeft.Type)
+	}
+	if peerLeft.PeerID != "bob" {
+		t.Fatalf("expected peerId=bob in peer_left, got %q", peerLeft.PeerID)
+	}
+}
+
+// TestCrossNodeMessageRelay tests bidirectional message relay with remote stubs.
+// It sets up a channel where the local peer sends a message and the remote peer
+// sends one back via handleRemoteRelay.
+func TestCrossNodeMessageRelay(t *testing.T) {
+	b := newTestBridge(t)
+	s := testServer(b)
+	defer s.Close()
+
+	ws := dial(t, s)
+	defer ws.Close(websocket.StatusNormalClosure, "")
+
+	channelId := "crossnode-relay-test"
+
+	// Local peer joins
+	send(t, ws, InMsg{Type: "join", Ch: channelId, ID: "alice", Role: "initiator"})
+	recv(t, ws) // challenge
+
+	// Remote peer joins
+	b.handleRemoteJoinNotify(channelId, RemoteJoinNotify{
+		PeerID: "bob",
+		Nonce:  []byte("remote-nonce-00000000000000000000"),
+	})
+	recv(t, ws) // re-challenge
+
+	// Both respond
+	send(t, ws, InMsg{Type: "response", Ch: channelId, Mac: b64.EncodeToString([]byte("mac-a")), Role: "initiator"})
+	b.handleRemoteResponse(channelId, RemoteResponse{
+		PeerID:   "bob",
+		Role:     "responder",
+		Nonce:    []byte("remote-nonce-00000000000000000000"),
+		Response: []byte("mac-b"),
+	})
+	recv(t, ws) // verify_peer
+
+	// Alice sends message to Bob (goes to remote peer via pub/sub, but we just verify state)
+	send(t, ws, InMsg{Type: "message", Ch: channelId, Data: b64.EncodeToString([]byte("msg-a-to-b"))})
+
+	// Bob sends message to Alice via handleRemoteRelay
+	b.handleRemoteRelay(channelId, RemoteRelay{
+		PeerID: "bob",
+		Data:   b64.EncodeToString([]byte("msg-b-to-a")),
+	})
+
+	msgA := recv(t, ws)
+	if msgA.Type != "message" {
+		t.Fatalf("expected message, got %s", msgA.Type)
+	}
+	dataA, _ := b64.DecodeString(msgA.Data)
+	if string(dataA) != "msg-b-to-a" {
+		t.Fatalf("expected 'msg-b-to-a', got %q", string(dataA))
+	}
+	if msgA.PeerID != "bob" {
+		t.Fatalf("expected peerId=bob, got %q", msgA.PeerID)
+	}
+
+	// Multiple messages from remote
+	for i := 0; i < 5; i++ {
+		payload := fmt.Sprintf("bulk-%d", i)
+		b.handleRemoteRelay(channelId, RemoteRelay{
+			PeerID: "bob",
+			Data:   b64.EncodeToString([]byte(payload)),
+		})
+		got := recv(t, ws)
+		d, _ := b64.DecodeString(got.Data)
+		if string(d) != payload {
+			t.Fatalf("bulk message %d: expected %q, got %q", i, payload, string(d))
+		}
+	}
+
+	// Verify MessagesRelayed counter was incremented for Alice's outgoing message
+	if b.MessagesRelayed.Load() < 1 {
+		t.Fatalf("expected MessagesRelayed >= 1, got %d", b.MessagesRelayed.Load())
+	}
+}
+
 func sendWS(t *testing.T, ws *websocket.Conn, msg InMsg) {
 	t.Helper()
 	data, err := json.Marshal(msg)
