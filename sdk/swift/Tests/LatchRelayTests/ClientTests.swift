@@ -19,7 +19,7 @@ final class ClientTests: XCTestCase {
 
         let client = LatchClient(serverURL: url, id: "test-peer")
         try await client.connect()
-        client.close()
+        await client.close()
     }
 
     func testTwoClientsPairAndExchange() async throws {
@@ -34,11 +34,6 @@ final class ClientTests: XCTestCase {
 
         try await client1.connect()
         try await client2.connect()
-
-        defer {
-            client1.close()
-            client2.close()
-        }
 
         let expectation = XCTestExpectation(description: "message received")
         var receivedMessage: String?
@@ -64,5 +59,8 @@ final class ClientTests: XCTestCase {
 
         await fulfillment(of: [expectation], timeout: 5.0)
         XCTAssertEqual(receivedMessage, "hello from A")
+
+        await client1.close()
+        await client2.close()
     }
 }

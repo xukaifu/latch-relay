@@ -150,7 +150,7 @@ final class CryptoTests: XCTestCase {
     func testSPAKE2KeyAgreement() throws {
         // Two parties perform SPAKE2 and should derive the same key
         let code = "TESTCODE"
-        let (pairingId, w) = derivePairingParams(code: code)
+        let (pairingId, w) = try derivePairingParams(code: code)
 
         // Both peers blind with M (pubShare sent before role assignment)
         let (x, pA) = spake2Start(w: w)
@@ -282,21 +282,88 @@ final class CryptoTests: XCTestCase {
 
     // MARK: - Pairing params determinism
 
-    func testPairingParamsDeterministic() {
-        let (id1, w1) = derivePairingParams(code: "ABC123")
-        let (id2, w2) = derivePairingParams(code: "ABC123")
+    func testPairingParamsDeterministic() throws {
+        let (id1, w1) = try derivePairingParams(code: "ABC123")
+        let (id2, w2) = try derivePairingParams(code: "ABC123")
         XCTAssertEqual(id1, id2)
         XCTAssertEqual(w1, w2)
 
         // Case insensitive
-        let (id3, w3) = derivePairingParams(code: "abc123")
+        let (id3, w3) = try derivePairingParams(code: "abc123")
         XCTAssertEqual(id1, id3)
         XCTAssertEqual(w1, w3)
     }
 
-    func testPairingParamsDifferentCodes() {
-        let (id1, _) = derivePairingParams(code: "CODE1")
-        let (id2, _) = derivePairingParams(code: "CODE2")
+    func testPairingParamsDifferentCodes() throws {
+        let (id1, _) = try derivePairingParams(code: "CODE1")
+        let (id2, _) = try derivePairingParams(code: "CODE2")
         XCTAssertNotEqual(id1, id2)
+    }
+
+    // MARK: - PBKDF2 determinism and case sensitivity
+
+    func testPBKDF2Deterministic() {
+        let salt = "test-salt".data(using: .utf8)!
+        let result1 = pbkdf2SHA256(password: "MyPassword", salt: salt, iterations: 1, keyLength: 32)
+        let result2 = pbkdf2SHA256(password: "MyPassword", salt: salt, iterations: 1, keyLength: 32)
+        XCTAssertEqual(result1, result2, "PBKDF2 should be deterministic for the same inputs")
+    }
+
+    func testPBKDF2CaseSensitive() {
+        let salt = "test-salt".data(using: .utf8)!
+        let lower = pbkdf2SHA256(password: "password", salt: salt, iterations: 1, keyLength: 32)
+        let upper = pbkdf2SHA256(password: "PASSWORD", salt: salt, iterations: 1, keyLength: 32)
+        XCTAssertNotEqual(lower, upper, "PBKDF2 itself is case-sensitive; case-insensitivity is handled by uppercasing the code before derivation")
+    }
+
+    // MARK: - SPAKE2 with different codes
+
+    func testSPAKE2DifferentCodesProduceDifferentKeys() throws {
+        let (pairingId1, w1) = try derivePairingParams(code: "ALPHA1")
+        let (pairingId2, w2) = try derivePairingParams(code: "BRAVO2")
+
+        let (x, pA) = spake2Start(w: w1)
+        let (y, pB) = spake2Start(w: w2)
+
+        let (channelId1, _) = try spake2InitiatorFinish(
+            x: x, w: w1, peerPubShare: pB,
+            myPubShare: pA, pairingId: pairingId1
+        )
+        let (channelId2, _) = try spake2ResponderFinish(
+            y: y, w: w2, peerPubShare: pA,
+            myPubShare: pB, pairingId: pairingId2
+        )
+
+        XCTAssertNotEqual(channelId1, channelId2, "Different codes should produce different channel IDs")
+    }
+
+    // MARK: - Challenge MAC with different roles
+
+    func testChallengeMACDifferentRoles() {
+        let key = SymmetricKey(data: Data(repeating: 0xAB, count: 32))
+        let nonce = Data(repeating: 0x01, count: 32)
+
+        let macInit = computeChallengeMAC(encKey: key, channelId: "ch1", nonce: nonce, id: "peer-A", role: "initiator")
+        let macResp = computeChallengeMAC(encKey: key, channelId: "ch1", nonce: nonce, id: "peer-A", role: "responder")
+        XCTAssertNotEqual(macInit, macResp, "Different roles should produce different MACs")
+    }
+
+    func testChallengeMACDifferentChannels() {
+        let key = SymmetricKey(data: Data(repeating: 0xAB, count: 32))
+        let nonce = Data(repeating: 0x01, count: 32)
+
+        let mac1 = computeChallengeMAC(encKey: key, channelId: "channel-a", nonce: nonce, id: "peer", role: "initiator")
+        let mac2 = computeChallengeMAC(encKey: key, channelId: "channel-b", nonce: nonce, id: "peer", role: "initiator")
+        XCTAssertNotEqual(mac1, mac2, "Different channel IDs should produce different MACs")
+    }
+
+    func testChallengeMACDifferentNonces() {
+        let key = SymmetricKey(data: Data(repeating: 0xAB, count: 32))
+        let nonce1 = Data(repeating: 0x01, count: 32)
+        let nonce2 = Data(repeating: 0x02, count: 32)
+
+        let mac1 = computeChallengeMAC(encKey: key, channelId: "ch1", nonce: nonce1, id: "peer", role: "initiator")
+        let mac2 = computeChallengeMAC(encKey: key, channelId: "ch1", nonce: nonce2, id: "peer", role: "initiator")
+        XCTAssertNotEqual(mac1, mac2, "Different nonces should produce different MACs")
     }
 }
