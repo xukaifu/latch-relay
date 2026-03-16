@@ -49,11 +49,12 @@ type WaitingPeer struct {
 
 // ChannelMember represents one peer in a channel.
 type ChannelMember struct {
-	Conn     *Connection
-	ID       string // peer's self-reported id
-	Role     string // "initiator" or "responder"
-	Nonce    []byte // challenge nonce
-	Response []byte // challenge response (MAC)
+	Conn     *Connection // nil for remote peers
+	ID       string      // peer's self-reported id
+	Role     string      // "initiator" or "responder"
+	Nonce    []byte      // challenge nonce
+	Response []byte      // challenge response (MAC)
+	Remote   bool        // true if peer is on another node
 }
 
 // Channel represents a 1:1 relay conduit.

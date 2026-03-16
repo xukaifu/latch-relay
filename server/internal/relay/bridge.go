@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -152,6 +153,7 @@ func NewBridge(cfg BridgeConfig) *Bridge {
 		stop:         make(chan struct{}),
 		startTime:    time.Now(),
 	}
+	b.backend.Subscribe(b.handleRemoteMsg)
 	go b.cleanupLoop()
 	return b
 }
@@ -292,13 +294,24 @@ func (b *Bridge) handlePair(conn *Connection, msg InMsg) {
 	b.PairingsCompleted.Add(1)
 	b.debugf("pair matched ch=%s initiator=%s responder=%s", msg.Ch[:min(16, len(msg.Ch))], match.Initiator.ID, match.Responder.ID)
 
-	sendMsg(match.Initiator.Conn, OutMsg{
-		Type:     "pair_matched",
-		Ch:       msg.Ch,
-		PubShare: b64.EncodeToString(match.Responder.PubShare),
-		ID:       match.Responder.ID,
-		Role:     "initiator",
-	})
+	if match.Initiator.Conn != nil {
+		// Local match: both peers on this node
+		sendMsg(match.Initiator.Conn, OutMsg{
+			Type:     "pair_matched",
+			Ch:       msg.Ch,
+			PubShare: b64.EncodeToString(match.Responder.PubShare),
+			ID:       match.Responder.ID,
+			Role:     "initiator",
+		})
+	} else {
+		// Cross-node: initiator is on another node, notify via pub/sub
+		data, _ := marshalRemoteMsg("pair_matched", msg.Ch, RemotePairMatched{
+			PairingID:    msg.Ch,
+			PeerID:       match.Responder.ID,
+			PeerPubShare: match.Responder.PubShare,
+		})
+		b.backend.Publish(msg.Ch, data)
+	}
 
 	sendMsg(conn, OutMsg{
 		Type:     "pair_matched",
@@ -410,7 +423,6 @@ func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
 				if _, err := rand.Read(freshNonce); err != nil {
 					log.Printf("failed to generate nonce: %v", err)
 					sendMsg(conn, OutMsg{Type: "error", Code: ErrInternal, Ch: msg.Ch, Message: "internal error"})
-					// Remove the newly added peer and restore channel to WaitPeer
 					ch.Peers[slot] = nil
 					conn.mu.Lock()
 					delete(conn.Channels, msg.Ch)
@@ -422,7 +434,16 @@ func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
 				}
 				ch.Peers[i].Nonce = freshNonce
 				ch.Peers[i].Response = nil
-				sendMsg(peer.Conn, OutMsg{Type: "challenge", Ch: msg.Ch, Nonce: b64.EncodeToString(freshNonce)})
+				if peer.Remote {
+					// Notify remote node to re-challenge its peer
+					data, _ := marshalRemoteMsg("join_notify", msg.Ch, RemoteJoinNotify{
+						PeerID: msg.ID,
+						Nonce:  nonce,
+					})
+					b.backend.Publish(msg.Ch, data)
+				} else {
+					sendMsg(peer.Conn, OutMsg{Type: "challenge", Ch: msg.Ch, Nonce: b64.EncodeToString(freshNonce)})
+				}
 			}
 		}
 
@@ -476,6 +497,18 @@ func (b *Bridge) handleResponse(conn *Connection, msg InMsg) {
 		ch.Peers[peerIdx].Role = msg.Role
 	}
 
+	// If the other peer is remote, forward our response via pub/sub
+	otherIdx := 1 - peerIdx
+	if ch.Peers[otherIdx] != nil && ch.Peers[otherIdx].Remote {
+		data, _ := marshalRemoteMsg("response", msg.Ch, RemoteResponse{
+			PeerID:   ch.Peers[peerIdx].ID,
+			Role:     ch.Peers[peerIdx].Role,
+			Nonce:    ch.Peers[peerIdx].Nonce,
+			Response: macBytes,
+		})
+		b.backend.Publish(msg.Ch, data)
+	}
+
 	// Check if both peers have responded
 	if ch.Peers[0] == nil || ch.Peers[1] == nil {
 		return
@@ -488,14 +521,19 @@ func (b *Bridge) handleResponse(conn *Connection, msg InMsg) {
 	b.debugf("verified ch=%s peer0=%s peer1=%s", msg.Ch[:min(16, len(msg.Ch))], ch.Peers[0].ID, ch.Peers[1].ID)
 	for i := 0; i < 2; i++ {
 		other := 1 - i
-		sendMsg(ch.Peers[i].Conn, OutMsg{
+		outMsg := OutMsg{
 			Type:      "verify_peer",
 			Ch:        msg.Ch,
 			PeerNonce: b64.EncodeToString(ch.Peers[other].Nonce),
 			PeerMac:   b64.EncodeToString(ch.Peers[other].Response),
 			PeerID:    ch.Peers[other].ID,
 			PeerRole:  ch.Peers[other].Role,
-		})
+		}
+		if ch.Peers[i].Remote {
+			// Remote peer's node handles its own verify_peer delivery
+			continue
+		}
+		sendMsg(ch.Peers[i].Conn, outMsg)
 	}
 
 	ch.State = StateActive
@@ -553,12 +591,21 @@ func (b *Bridge) handleRelay(conn *Connection, msg InMsg) {
 	b.MessagesRelayed.Add(1)
 	b.debugf("relay ch=%s from=%s to=%s bytes=%d", msg.Ch[:min(16, len(msg.Ch))], ch.Peers[senderIdx].ID, ch.Peers[otherIdx].ID, len(msg.Data))
 
-	sendMsg(ch.Peers[otherIdx].Conn, OutMsg{
-		Type:   "message",
-		Ch:     msg.Ch,
-		PeerID: ch.Peers[senderIdx].ID,
-		Data:   msg.Data,
-	})
+	if ch.Peers[otherIdx].Remote {
+		// Cross-node: forward via pub/sub
+		data, _ := marshalRemoteMsg("relay", msg.Ch, RemoteRelay{
+			PeerID: ch.Peers[senderIdx].ID,
+			Data:   msg.Data,
+		})
+		b.backend.Publish(msg.Ch, data)
+	} else {
+		sendMsg(ch.Peers[otherIdx].Conn, OutMsg{
+			Type:   "message",
+			Ch:     msg.Ch,
+			PeerID: ch.Peers[senderIdx].ID,
+			Data:   msg.Data,
+		})
+	}
 }
 
 func (b *Bridge) handleLeave(conn *Connection, msg InMsg) {
@@ -676,7 +723,13 @@ func (b *Bridge) removePeerFromChannelLocked(ch *Channel, chID string, conn *Con
 	remaining.Nonce = nil
 	remaining.Response = nil
 
-	sendMsg(remaining.Conn, OutMsg{Type: "peer_left", Ch: chID, PeerID: removedID})
+	if remaining.Remote {
+		// Notify remote node
+		data, _ := marshalRemoteMsg("peer_left", chID, RemotePeerLeft{PeerID: removedID})
+		b.backend.Publish(chID, data)
+	} else {
+		sendMsg(remaining.Conn, OutMsg{Type: "peer_left", Ch: chID, PeerID: removedID})
+	}
 
 	go b.waitPeerTimeout(chID, gen)
 	return false
@@ -792,5 +845,250 @@ func sendMsg(conn *Connection, msg OutMsg) {
 	}
 	if err := conn.Conn.Write(ctx, websocket.MessageText, data); err == nil && conn.bytesOut != nil {
 		conn.bytesOut.Add(int64(len(data)))
+	}
+}
+
+// handleRemoteMsg dispatches messages received from other nodes via pub/sub.
+func (b *Bridge) handleRemoteMsg(channelId string, msg []byte) {
+	var env RemoteMsg
+	if err := json.Unmarshal(msg, &env); err != nil {
+		return
+	}
+
+	switch env.Type {
+	case "pair_matched":
+		var pm RemotePairMatched
+		if err := json.Unmarshal(env.Data, &pm); err != nil {
+			return
+		}
+		b.handleRemotePairMatched(env.Ch, pm)
+
+	case "relay":
+		var rm RemoteRelay
+		if err := json.Unmarshal(env.Data, &rm); err != nil {
+			return
+		}
+		b.handleRemoteRelay(env.Ch, rm)
+
+	case "join_notify":
+		var jn RemoteJoinNotify
+		if err := json.Unmarshal(env.Data, &jn); err != nil {
+			return
+		}
+		b.handleRemoteJoinNotify(env.Ch, jn)
+
+	case "response":
+		var rr RemoteResponse
+		if err := json.Unmarshal(env.Data, &rr); err != nil {
+			return
+		}
+		b.handleRemoteResponse(env.Ch, rr)
+
+	case "peer_left":
+		var pl RemotePeerLeft
+		if err := json.Unmarshal(env.Data, &pl); err != nil {
+			return
+		}
+		b.handleRemotePeerLeft(env.Ch, pl)
+	}
+}
+
+// handleRemotePairMatched delivers pair_matched to a local waiting peer
+// when the match was made on another node.
+func (b *Bridge) handleRemotePairMatched(pairingId string, pm RemotePairMatched) {
+	// The local peer was the initiator (first to store).
+	// Find its connection from the backend's local cache.
+	b.backend.(*RedisBackend).mu.Lock()
+	entry, ok := b.backend.(*RedisBackend).local[pairingId]
+	var conn *Connection
+	if ok {
+		conn = entry.info.Conn
+		delete(b.backend.(*RedisBackend).local, pairingId)
+	}
+	b.backend.(*RedisBackend).mu.Unlock()
+
+	if conn == nil {
+		return
+	}
+
+	b.debugf("remote pair_matched ch=%s local_peer=%s remote_peer=%s", pairingId[:min(16, len(pairingId))], entry.info.ID, pm.PeerID)
+
+	sendMsg(conn, OutMsg{
+		Type:     "pair_matched",
+		Ch:       pairingId,
+		PubShare: b64.EncodeToString(pm.PeerPubShare),
+		ID:       pm.PeerID,
+		Role:     "initiator",
+	})
+}
+
+// handleRemoteRelay delivers a relayed message from a remote peer to the local peer.
+func (b *Bridge) handleRemoteRelay(channelId string, rm RemoteRelay) {
+	b.mu.Lock()
+	ch, exists := b.channels[channelId]
+	if exists {
+		ch.mu.Lock()
+	}
+	b.mu.Unlock()
+
+	if !exists {
+		return
+	}
+	defer ch.mu.Unlock()
+
+	// Find the local peer to deliver to
+	for _, peer := range ch.Peers {
+		if peer != nil && !peer.Remote && peer.Conn != nil {
+			sendMsg(peer.Conn, OutMsg{
+				Type:   "message",
+				Ch:     channelId,
+				PeerID: rm.PeerID,
+				Data:   rm.Data,
+			})
+			return
+		}
+	}
+}
+
+// handleRemoteJoinNotify handles a remote peer joining a channel.
+// Creates a remote stub in the channel and re-challenges the local peer.
+func (b *Bridge) handleRemoteJoinNotify(channelId string, jn RemoteJoinNotify) {
+	b.mu.Lock()
+	ch, exists := b.channels[channelId]
+	if !exists {
+		if len(b.channels) >= b.cfg.MaxChannelsTotal {
+			b.mu.Unlock()
+			return
+		}
+		ch = &Channel{State: StateWaitPeer}
+		b.channels[channelId] = ch
+	}
+	ch.mu.Lock()
+	b.mu.Unlock()
+	defer ch.mu.Unlock()
+
+	// Find a free slot for the remote peer
+	slot := -1
+	for i, peer := range ch.Peers {
+		if peer != nil && peer.ID == jn.PeerID {
+			// Already known, update
+			ch.Peers[i].Nonce = jn.Nonce
+			ch.Peers[i].Response = nil
+			slot = -2 // signal: updated existing
+			break
+		}
+		if peer == nil && slot == -1 {
+			slot = i
+		}
+	}
+
+	if slot >= 0 {
+		ch.Peers[slot] = &ChannelMember{
+			ID:     jn.PeerID,
+			Nonce:  jn.Nonce,
+			Remote: true,
+		}
+	}
+
+	// Re-challenge the local peer with a fresh nonce
+	ch.State = StateChallenging
+	for i, peer := range ch.Peers {
+		if peer != nil && !peer.Remote && peer.Conn != nil {
+			freshNonce := make([]byte, 32)
+			rand.Read(freshNonce)
+			ch.Peers[i].Nonce = freshNonce
+			ch.Peers[i].Response = nil
+			sendMsg(peer.Conn, OutMsg{Type: "challenge", Ch: channelId, Nonce: b64.EncodeToString(freshNonce)})
+		}
+	}
+}
+
+// handleRemoteResponse handles a challenge response from a remote peer.
+func (b *Bridge) handleRemoteResponse(channelId string, rr RemoteResponse) {
+	b.mu.Lock()
+	ch, exists := b.channels[channelId]
+	if exists {
+		ch.mu.Lock()
+	}
+	b.mu.Unlock()
+
+	if !exists {
+		return
+	}
+	defer ch.mu.Unlock()
+
+	// Store the remote peer's response
+	for _, peer := range ch.Peers {
+		if peer != nil && peer.ID == rr.PeerID {
+			peer.Response = rr.Response
+			peer.Nonce = rr.Nonce
+			if rr.Role != "" {
+				peer.Role = rr.Role
+			}
+			break
+		}
+	}
+
+	// Check if both peers have responded
+	if ch.Peers[0] == nil || ch.Peers[1] == nil {
+		return
+	}
+	if ch.Peers[0].Response == nil || ch.Peers[1].Response == nil {
+		return
+	}
+
+	// Both responded: send verify_peer to local peer, publish for remote
+	b.debugf("verified (cross-node) ch=%s peer0=%s peer1=%s", channelId[:min(16, len(channelId))], ch.Peers[0].ID, ch.Peers[1].ID)
+	for i := 0; i < 2; i++ {
+		other := 1 - i
+		outMsg := OutMsg{
+			Type:      "verify_peer",
+			Ch:        channelId,
+			PeerNonce: b64.EncodeToString(ch.Peers[other].Nonce),
+			PeerMac:   b64.EncodeToString(ch.Peers[other].Response),
+			PeerID:    ch.Peers[other].ID,
+			PeerRole:  ch.Peers[other].Role,
+		}
+		if !ch.Peers[i].Remote {
+			sendMsg(ch.Peers[i].Conn, outMsg)
+		}
+		// Remote peer's node handles verify_peer delivery from its own response flow
+	}
+
+	ch.State = StateActive
+	for _, peer := range ch.Peers {
+		if peer != nil {
+			peer.Nonce = nil
+			peer.Response = nil
+		}
+	}
+}
+
+// handleRemotePeerLeft handles notification that a remote peer left.
+func (b *Bridge) handleRemotePeerLeft(channelId string, pl RemotePeerLeft) {
+	b.mu.Lock()
+	ch, exists := b.channels[channelId]
+	if exists {
+		ch.mu.Lock()
+	}
+	b.mu.Unlock()
+
+	if !exists {
+		return
+	}
+	defer ch.mu.Unlock()
+
+	for i, peer := range ch.Peers {
+		if peer != nil && peer.Remote && peer.ID == pl.PeerID {
+			ch.Peers[i] = nil
+
+			// Notify local peer
+			for _, local := range ch.Peers {
+				if local != nil && !local.Remote && local.Conn != nil {
+					sendMsg(local.Conn, OutMsg{Type: "peer_left", Ch: channelId, PeerID: pl.PeerID})
+				}
+			}
+			break
+		}
 	}
 }
