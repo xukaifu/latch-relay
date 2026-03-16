@@ -30,24 +30,25 @@ type BridgeConfig struct {
 	IdleTimeout       time.Duration
 	ChallengeTimeout  time.Duration
 	WaitPeerTimeout   time.Duration
-	MaxPairingsPerIP  int // 0 = default (5)
-	MaxChannelsPerIP  int // 0 = default (20)
+	MaxPairingsPerIP  int // 0 = default (60)
+	MaxChannelsPerIP  int // 0 = default (30)
 	Debug             bool
+	Backend           Backend // nil = auto-create MemoryBackend
 }
 
 // Bridge is the central relay server state.
 type Bridge struct {
-	mu           sync.Mutex
-	waitingPeers map[string]*WaitingPeer // pairingId -> WaitingPeer
-	channels     map[string]*Channel     // channelId -> Channel
-	connections  map[*Connection]bool    // all active connections
-	cfg          BridgeConfig
-	connRate     *RateLimiter // per-IP connection rate
-	joinRate     *RateLimiter // per-channelId join rate
-	pairRate     *RateLimiter // per-IP pairing rate (MaxPairingsPerIP = 5)
-	channelRate  *RateLimiter // per-IP channel rate (MaxChannelsPerIP = 20)
-	stop         chan struct{}
-	startTime    time.Time
+	mu          sync.Mutex
+	channels    map[string]*Channel  // channelId -> Channel
+	connections map[*Connection]bool // all active connections
+	backend     Backend              // pairing storage + cross-node messaging
+	cfg         BridgeConfig
+	connRate    *RateLimiter // per-IP connection rate
+	joinRate    *RateLimiter // per-channelId join rate
+	pairRate    *RateLimiter // per-IP pairing rate
+	channelRate *RateLimiter // per-IP channel rate
+	stop        chan struct{}
+	startTime   time.Time
 
 	// Cumulative counters (atomic)
 	BytesIn           atomic.Int64
@@ -79,7 +80,6 @@ func (b *Bridge) Stats() Stats {
 	b.mu.Lock()
 	conns := len(b.connections)
 	chTotal := len(b.channels)
-	waiting := len(b.waitingPeers)
 	// Snapshot channel pointers under b.mu, then release before locking
 	// individual channels to avoid AB-BA deadlock with removePeerFromChannelLocked.
 	channels := make([]*Channel, 0, chTotal)
@@ -111,7 +111,7 @@ func (b *Bridge) Stats() Stats {
 		ChannelsWaiting:   chWaiting,
 		ChannelsChallenging: chChallenging,
 		ChannelsActive:    chActive,
-		WaitingPairings:   waiting,
+		WaitingPairings:   b.backend.PairingCount(),
 		MessagesRelayed:   b.MessagesRelayed.Load(),
 		PairingsCompleted: b.PairingsCompleted.Load(),
 		TotalConnections:  b.TotalConnections.Load(),
@@ -136,11 +136,15 @@ func NewBridge(cfg BridgeConfig) *Bridge {
 	if chanLimit <= 0 {
 		chanLimit = 30
 	}
+	backend := cfg.Backend
+	if backend == nil {
+		backend = NewMemoryBackend()
+	}
 	b := &Bridge{
-		waitingPeers: make(map[string]*WaitingPeer),
-		channels:     make(map[string]*Channel),
-		connections:  make(map[*Connection]bool),
-		cfg:          cfg,
+		channels:    make(map[string]*Channel),
+		connections: make(map[*Connection]bool),
+		backend:     backend,
+		cfg:         cfg,
 		connRate:     NewRateLimiter(10, time.Second),
 		joinRate:     NewRateLimiter(3, 10*time.Second),
 		pairRate:     NewRateLimiter(pairLimit, time.Minute),
@@ -152,9 +156,10 @@ func NewBridge(cfg BridgeConfig) *Bridge {
 	return b
 }
 
-// Close stops background goroutines.
+// Close stops background goroutines and the backend.
 func (b *Bridge) Close() {
 	close(b.stop)
+	b.backend.Close()
 }
 
 // cleanupLoop periodically removes expired waiting peers.
@@ -168,27 +173,9 @@ func (b *Bridge) cleanupLoop() {
 		case <-ticker.C:
 		}
 
-		// Collect expired peers under lock, send messages after releasing
-		var expired []struct {
-			conn *Connection
-			id   string
-		}
-
-		b.mu.Lock()
-		now := time.Now()
-		for id, wp := range b.waitingPeers {
-			if now.Sub(wp.Created) > b.cfg.PairingTTL {
-				expired = append(expired, struct {
-					conn *Connection
-					id   string
-				}{wp.Conn, id})
-				delete(b.waitingPeers, id)
-			}
-		}
-		b.mu.Unlock()
-
+		expired := b.backend.CleanupPairings(b.cfg.PairingTTL)
 		for _, e := range expired {
-			sendMsg(e.conn, OutMsg{Type: "error", Code: ErrPairingExpired, Ch: e.id})
+			sendMsg(e.Conn, OutMsg{Type: "error", Code: ErrPairingExpired, Ch: e.PairingID})
 		}
 
 		// Prune stale rate-limiter entries to prevent unbounded memory growth
@@ -221,14 +208,10 @@ func (b *Bridge) UnregisterConn(conn *Connection) {
 	}
 	conn.mu.Unlock()
 
-	b.mu.Lock()
+	// Remove from waiting peers (backend handles its own locking)
+	b.backend.RemovePairingsByConn(conn)
 
-	// Remove from waiting peers
-	for id, wp := range b.waitingPeers {
-		if wp.Conn == conn {
-			delete(b.waitingPeers, id)
-		}
-	}
+	b.mu.Lock()
 
 	// Remove from channels
 	for chID := range channelsCopy {
@@ -289,56 +272,39 @@ func (b *Bridge) handlePair(conn *Connection, msg InMsg) {
 		return
 	}
 
-	b.mu.Lock()
+	match, err := b.backend.StorePairing(msg.Ch, PairingInfo{
+		Conn:     conn,
+		ID:       msg.ID,
+		PubShare: pubShareBytes,
+	})
+	if err != nil {
+		sendMsg(conn, OutMsg{Type: "error", Code: ErrInternal, Ch: msg.Ch, Message: "pairing error"})
+		return
+	}
 
-	wp, exists := b.waitingPeers[msg.Ch]
-	if !exists {
-		// First peer: store as waiting
+	if match == nil {
+		// First peer: waiting
 		b.debugf("pair wait ch=%s id=%s ip=%s", msg.Ch[:min(16, len(msg.Ch))], msg.ID, conn.IP)
-		b.waitingPeers[msg.Ch] = &WaitingPeer{
-			Conn:     conn,
-			ID:       msg.ID,
-			PubShare: pubShareBytes,
-			Created:  time.Now(),
-		}
-		b.mu.Unlock()
 		return
 	}
 
-	// Check if expired
-	if time.Since(wp.Created) > b.cfg.PairingTTL {
-		delete(b.waitingPeers, msg.Ch)
-		b.mu.Unlock()
-		sendMsg(conn, OutMsg{Type: "error", Code: ErrPairingExpired, Ch: msg.Ch})
-		return
-	}
-
-	// Second peer: match — collect data under lock, send after release
-	initiatorConn := wp.Conn
-	initiatorPubShare := wp.PubShare
-	initiatorID := wp.ID
-	responderPubShare := pubShareBytes
-	responderID := msg.ID
-
-	delete(b.waitingPeers, msg.Ch)
-	b.mu.Unlock()
-
+	// Matched
 	b.PairingsCompleted.Add(1)
-	b.debugf("pair matched ch=%s initiator=%s responder=%s", msg.Ch[:min(16, len(msg.Ch))], initiatorID, responderID)
+	b.debugf("pair matched ch=%s initiator=%s responder=%s", msg.Ch[:min(16, len(msg.Ch))], match.Initiator.ID, match.Responder.ID)
 
-	sendMsg(initiatorConn, OutMsg{
+	sendMsg(match.Initiator.Conn, OutMsg{
 		Type:     "pair_matched",
 		Ch:       msg.Ch,
-		PubShare: b64.EncodeToString(responderPubShare),
-		ID:       responderID,
+		PubShare: b64.EncodeToString(match.Responder.PubShare),
+		ID:       match.Responder.ID,
 		Role:     "initiator",
 	})
 
 	sendMsg(conn, OutMsg{
 		Type:     "pair_matched",
 		Ch:       msg.Ch,
-		PubShare: b64.EncodeToString(initiatorPubShare),
-		ID:       initiatorID,
+		PubShare: b64.EncodeToString(match.Initiator.PubShare),
+		ID:       match.Initiator.ID,
 		Role:     "responder",
 	})
 }

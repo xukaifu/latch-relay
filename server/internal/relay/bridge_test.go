@@ -114,16 +114,9 @@ func TestPairingFirstPeerWaits(t *testing.T) {
 		t.Fatalf("expected no message, got %+v", msg)
 	}
 
-	// Verify internal state
-	b.mu.Lock()
-	wp, exists := b.waitingPeers["pairing1"]
-	b.mu.Unlock()
-
-	if !exists {
-		t.Fatal("expected waiting peer to be stored")
-	}
-	if wp.ID != "peer-A" {
-		t.Fatalf("expected waiting peer ID 'peer-A', got %q", wp.ID)
+	// Verify internal state via backend
+	if b.backend.PairingCount() != 1 {
+		t.Fatalf("expected 1 waiting peer, got %d", b.backend.PairingCount())
 	}
 }
 
@@ -196,10 +189,7 @@ func TestPairingSecondPeerTriggerMatch(t *testing.T) {
 	}
 
 	// Waiting peer should be removed
-	b.mu.Lock()
-	_, exists := b.waitingPeers["pairing1"]
-	b.mu.Unlock()
-	if exists {
+	if b.backend.PairingCount() != 0 {
 		t.Fatal("expected waiting peer to be removed after match")
 	}
 }
