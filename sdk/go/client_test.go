@@ -336,3 +336,256 @@ func TestSPAKE2LargeW(t *testing.T) {
 		t.Fatal("keys don't match with large w")
 	}
 }
+
+func TestNewClientInvalidURL(t *testing.T) {
+	// Completely invalid URL scheme
+	_, err := NewClient("not-a-url", "test-id")
+	if err == nil {
+		t.Fatal("expected error for invalid URL")
+	}
+
+	// Unreachable host
+	_, err = NewClient("ws://127.0.0.1:1/nonexistent", "test-id")
+	if err == nil {
+		t.Fatal("expected error for unreachable host")
+	}
+
+	// Empty URL
+	_, err = NewClient("", "test-id")
+	if err == nil {
+		t.Fatal("expected error for empty URL")
+	}
+}
+
+func TestDerivePairingParamsBothWindows(t *testing.T) {
+	current, previous := DerivePairingKeysForWindows("HELLO")
+
+	// Both should produce valid 64-char hex pairingIDs
+	if len(current.PairingID) != 64 {
+		t.Fatalf("current pairingID length: got %d, want 64", len(current.PairingID))
+	}
+	if len(previous.PairingID) != 64 {
+		t.Fatalf("previous pairingID length: got %d, want 64", len(previous.PairingID))
+	}
+
+	// Both w values must be valid non-zero scalars in [1, n)
+	if current.W == nil || current.W.Sign() <= 0 {
+		t.Fatal("current w is nil or non-positive")
+	}
+	if current.W.Cmp(p256N) >= 0 {
+		t.Fatal("current w >= curve order")
+	}
+	if previous.W == nil || previous.W.Sign() <= 0 {
+		t.Fatal("previous w is nil or non-positive")
+	}
+	if previous.W.Cmp(p256N) >= 0 {
+		t.Fatal("previous w >= curve order")
+	}
+
+	// Current and previous must differ (different time windows)
+	if current.PairingID == previous.PairingID {
+		t.Fatal("current and previous pairingID should differ")
+	}
+	if current.W.Cmp(previous.W) == 0 {
+		t.Fatal("current and previous w should differ")
+	}
+
+	// Calling again with same code should be deterministic (same time window)
+	current2, previous2 := DerivePairingKeysForWindows("HELLO")
+	if current.PairingID != current2.PairingID {
+		t.Fatal("current pairingID not deterministic")
+	}
+	if current.W.Cmp(current2.W) != 0 {
+		t.Fatal("current w not deterministic")
+	}
+	if previous.PairingID != previous2.PairingID {
+		t.Fatal("previous pairingID not deterministic")
+	}
+	if previous.W.Cmp(previous2.W) != 0 {
+		t.Fatal("previous w not deterministic")
+	}
+
+	// Case insensitive
+	currentLower, _ := DerivePairingKeysForWindows("hello")
+	if current.PairingID != currentLower.PairingID {
+		t.Fatal("pairing derivation should be case insensitive")
+	}
+}
+
+func TestSendOnUnknownChannel(t *testing.T) {
+	// Create a minimal LatchClient without a real WebSocket connection
+	// to test Send's channel lookup logic.
+	c := &LatchClient{
+		channels: make(map[string]*ChannelState),
+		closed:   make(chan struct{}),
+	}
+
+	err := c.Send("nonexistent-channel", []byte("hello"))
+	if err == nil {
+		t.Fatal("expected error for unknown channel")
+	}
+}
+
+func TestSendOnInactiveChannel(t *testing.T) {
+	c := &LatchClient{
+		channels: map[string]*ChannelState{
+			"ch1": {
+				ChannelID: "ch1",
+				EncKey:    bytes.Repeat([]byte{0x42}, 32),
+				Active:    false,
+			},
+		},
+		closed: make(chan struct{}),
+	}
+
+	err := c.Send("ch1", []byte("hello"))
+	if err == nil {
+		t.Fatal("expected error for inactive channel")
+	}
+}
+
+func TestChannelsReturnsCopy(t *testing.T) {
+	original := &ChannelState{
+		ChannelID: "ch1",
+		EncKey:    []byte{1, 2, 3},
+		Role:      "initiator",
+		PeerID:    "peer1",
+		Active:    true,
+	}
+
+	c := &LatchClient{
+		channels: map[string]*ChannelState{"ch1": original},
+		closed:   make(chan struct{}),
+	}
+
+	chs := c.Channels()
+
+	// Should contain the channel
+	if len(chs) != 1 {
+		t.Fatalf("expected 1 channel, got %d", len(chs))
+	}
+
+	got := chs["ch1"]
+	if got.ChannelID != "ch1" || got.Role != "initiator" {
+		t.Fatal("channel data mismatch")
+	}
+
+	// Mutating the copy should not affect the original
+	got.Active = false
+	if !original.Active {
+		t.Fatal("Channels() should return a deep copy")
+	}
+}
+
+func TestClientIDAccessor(t *testing.T) {
+	c := &LatchClient{id: "test-peer-id"}
+	if c.ID() != "test-peer-id" {
+		t.Fatalf("ID() = %q, want %q", c.ID(), "test-peer-id")
+	}
+}
+
+// Cross-SDK compatibility test vectors.
+// These values were generated using the Go SDK with known inputs and verified
+// against the Node SDK's identical algorithm. Any change to the key derivation
+// in either SDK should cause this test to fail.
+func TestCrossSDKPairingKeyDerivation(t *testing.T) {
+	// Vector 1: code="TESTCODE", window=100
+	pairingID, w := derivePairingKeysForWindow("TESTCODE", 100)
+	expectedPairingID := "f5dedd846ba42b0bd9a5007e8e4b389207b318dd0cb91cf4a6d8afbe5f1f3aad"
+	expectedW := "4d54a247c68bbe7625e8ef068075fb60458756129b3bd041e0719923b863afb9"
+
+	if pairingID != expectedPairingID {
+		t.Fatalf("pairingID mismatch:\n  got:  %s\n  want: %s", pairingID, expectedPairingID)
+	}
+	wHex := fmt.Sprintf("%x", w)
+	if wHex != expectedW {
+		t.Fatalf("w mismatch:\n  got:  %s\n  want: %s", wHex, expectedW)
+	}
+
+	// Vector 2: code="CROSSTEST", window=42
+	pairingID2, w2 := derivePairingKeysForWindow("CROSSTEST", 42)
+	expectedPairingID2 := "8c014bda4dc926751411fd72ec45729f4d2f694755cf8da6ea0805db1a6a28d0"
+	expectedW2 := "dd5cd5dc4680247e510ecf26e95dc7e645969b440e9dd4fa4b393c2a8f3b6ee0"
+
+	if pairingID2 != expectedPairingID2 {
+		t.Fatalf("pairingID2 mismatch:\n  got:  %s\n  want: %s", pairingID2, expectedPairingID2)
+	}
+	w2Hex := fmt.Sprintf("%x", w2)
+	if w2Hex != expectedW2 {
+		t.Fatalf("w2 mismatch:\n  got:  %s\n  want: %s", w2Hex, expectedW2)
+	}
+}
+
+func TestCrossSDKDeriveChannelKeys(t *testing.T) {
+	// Fixed Ke = repeat(0xAB, 32), pairingID = "test-pairing"
+	ke := bytes.Repeat([]byte{0xAB}, 32)
+	channelID, encKey := DeriveChannelKeys(ke, "test-pairing")
+
+	expectedChannelID := "b5acadc39b84f9a7e81b786f49e3d9dcea5c4f81ee0c33804c22d29d364f3d84"
+	expectedEncKey := "f02e25385caad091f3fb65e29b0f6849fd302e950880f812e9cf37d87a3338b8"
+
+	if channelID != expectedChannelID {
+		t.Fatalf("channelID mismatch:\n  got:  %s\n  want: %s", channelID, expectedChannelID)
+	}
+	encKeyHex := fmt.Sprintf("%x", encKey)
+	if encKeyHex != expectedEncKey {
+		t.Fatalf("encKey mismatch:\n  got:  %s\n  want: %s", encKeyHex, expectedEncKey)
+	}
+}
+
+func TestCrossSDKChallengeMac(t *testing.T) {
+	encKey := bytes.Repeat([]byte{0xCD}, 32)
+	nonce := bytes.Repeat([]byte{0x01}, 32)
+	mac := ComputeChallengeMac(encKey, "test-channel", nonce, "peer1", "initiator")
+
+	expectedMAC := "6bfc9c5ac9d0293371080e7f05ebfcf05e687e9a6b0ca313f6e8a9b8e2b9d507"
+	macHex := fmt.Sprintf("%x", mac)
+	if macHex != expectedMAC {
+		t.Fatalf("MAC mismatch:\n  got:  %s\n  want: %s", macHex, expectedMAC)
+	}
+}
+
+func TestCrossSDKEncryptDecryptFormat(t *testing.T) {
+	// Verify that the Go SDK's ciphertext format (nonce || ciphertext || tag)
+	// matches the Node SDK's format, so cross-SDK decryption works.
+	key := bytes.Repeat([]byte{0x42}, 32)
+	channelID := "cross-sdk-channel"
+	plaintext := []byte("cross-sdk message")
+
+	ct, err := Encrypt(key, plaintext, channelID)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+
+	// Format: nonce(12) || encrypted(len(plaintext)) || tag(16)
+	expectedLen := 12 + len(plaintext) + 16
+	if len(ct) != expectedLen {
+		t.Fatalf("ciphertext length: got %d, want %d", len(ct), expectedLen)
+	}
+
+	// Decrypt should round-trip
+	pt, err := Decrypt(key, ct, channelID)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if !bytes.Equal(pt, plaintext) {
+		t.Fatalf("plaintext mismatch: got %q, want %q", pt, plaintext)
+	}
+
+	// Empty plaintext should also work (Node SDK supports this)
+	ctEmpty, err := Encrypt(key, []byte{}, channelID)
+	if err != nil {
+		t.Fatalf("encrypt empty: %v", err)
+	}
+	// nonce(12) + tag(16) = 28 bytes minimum
+	if len(ctEmpty) != 28 {
+		t.Fatalf("empty ciphertext length: got %d, want 28", len(ctEmpty))
+	}
+	ptEmpty, err := Decrypt(key, ctEmpty, channelID)
+	if err != nil {
+		t.Fatalf("decrypt empty: %v", err)
+	}
+	if len(ptEmpty) != 0 {
+		t.Fatalf("expected empty plaintext, got %d bytes", len(ptEmpty))
+	}
+}
