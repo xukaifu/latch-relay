@@ -1079,7 +1079,7 @@ func TestHandleRemoteMsgDispatch(t *testing.T) {
 	recv(t, ws) // challenge
 
 	// Test join_notify via handleRemoteMsg
-	joinData, _ := marshalRemoteMsg("join_notify", channelId, RemoteJoinNotify{
+	joinData, _ := marshalRemoteMsg("join_notify", channelId, "other-node", RemoteJoinNotify{
 		PeerID: "remote",
 		Nonce:  []byte("nonce-for-remote-peer-0000000000"),
 	})
@@ -1093,7 +1093,7 @@ func TestHandleRemoteMsgDispatch(t *testing.T) {
 	send(t, ws, InMsg{Type: "response", Ch: channelId, Mac: b64.EncodeToString([]byte("mac-local")), Role: "initiator"})
 
 	// Test response via handleRemoteMsg
-	respData, _ := marshalRemoteMsg("response", channelId, RemoteResponse{
+	respData, _ := marshalRemoteMsg("response", channelId, "other-node", RemoteResponse{
 		PeerID:   "remote",
 		Role:     "responder",
 		Nonce:    []byte("nonce-for-remote-peer-0000000000"),
@@ -1106,7 +1106,7 @@ func TestHandleRemoteMsgDispatch(t *testing.T) {
 	}
 
 	// Test relay via handleRemoteMsg
-	relayData, _ := marshalRemoteMsg("relay", channelId, RemoteRelay{
+	relayData, _ := marshalRemoteMsg("relay", channelId, "other-node", RemoteRelay{
 		PeerID: "remote",
 		Data:   b64.EncodeToString([]byte("relayed-msg")),
 	})
@@ -1117,7 +1117,7 @@ func TestHandleRemoteMsgDispatch(t *testing.T) {
 	}
 
 	// Test peer_left via handleRemoteMsg
-	leftData, _ := marshalRemoteMsg("peer_left", channelId, RemotePeerLeft{PeerID: "remote"})
+	leftData, _ := marshalRemoteMsg("peer_left", channelId, "other-node", RemotePeerLeft{PeerID: "remote"})
 	b.handleRemoteMsg(channelId, leftData)
 	pl := recv(t, ws)
 	if pl.Type != "peer_left" {
@@ -1128,8 +1128,7 @@ func TestHandleRemoteMsgDispatch(t *testing.T) {
 	b.handleRemoteMsg(channelId, []byte("invalid json"))
 
 	// Test pair_matched via handleRemoteMsg (no waiting peer, just tests dispatch)
-	pmData, _ := marshalRemoteMsg("pair_matched", "some-pairing", RemotePairMatched{
-		PairingID:    "some-pairing",
+	pmData, _ := marshalRemoteMsg("pair_matched", "some-pairing", "other-node", RemotePairMatched{
 		PeerID:       "someone",
 		PeerPubShare: []byte("share"),
 	})

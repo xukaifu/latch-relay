@@ -54,6 +54,9 @@ type Backend interface {
 	// No-op for single-node backends.
 	Subscribe(handler func(channelId string, msg []byte)) error
 
+	// NodeID returns this node's unique identifier (empty for MemoryBackend).
+	NodeID() string
+
 	// Close shuts down the backend.
 	Close()
 }

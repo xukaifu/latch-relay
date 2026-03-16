@@ -215,6 +215,8 @@ func (r *RedisBackend) PopLocalPairing(pairingId string) *PairingInfo {
 	return &entry.info
 }
 
+func (r *RedisBackend) NodeID() string { return r.nodeID }
+
 func (r *RedisBackend) Publish(channelId string, msg []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

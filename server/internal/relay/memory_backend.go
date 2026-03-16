@@ -100,6 +100,8 @@ func (m *MemoryBackend) PopLocalPairing(pairingId string) *PairingInfo {
 	return &entry.info
 }
 
+func (m *MemoryBackend) NodeID() string { return "" }
+
 // Publish is a no-op for single-node memory backend.
 func (m *MemoryBackend) Publish(channelId string, msg []byte) error { return nil }
 

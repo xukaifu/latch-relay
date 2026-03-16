@@ -4,16 +4,16 @@ import "encoding/json"
 
 // RemoteMsg is the envelope for cross-node messages via pub/sub.
 type RemoteMsg struct {
-	Type string          `json:"type"`
-	Ch   string          `json:"ch"`
-	Data json.RawMessage `json:"data,omitempty"`
+	Type   string          `json:"type"`
+	Ch     string          `json:"ch"`
+	NodeID string          `json:"nodeId"` // sender node, used to skip self-echo
+	Data   json.RawMessage `json:"data,omitempty"`
 }
 
 // Remote message types exchanged between nodes via pub/sub.
 
 // RemotePairMatched notifies a node that its waiting peer was matched.
 type RemotePairMatched struct {
-	PairingID    string `json:"pairingId"`
 	PeerID       string `json:"peerId"`
 	PeerPubShare []byte `json:"peerPubShare"`
 }
@@ -43,10 +43,10 @@ type RemotePeerLeft struct {
 	PeerID string `json:"peerId"`
 }
 
-func marshalRemoteMsg(msgType, ch string, data any) ([]byte, error) {
+func marshalRemoteMsg(msgType, ch, nodeID string, data any) ([]byte, error) {
 	d, err := json.Marshal(data)
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(RemoteMsg{Type: msgType, Ch: ch, Data: d})
+	return json.Marshal(RemoteMsg{Type: msgType, Ch: ch, NodeID: nodeID, Data: d})
 }
