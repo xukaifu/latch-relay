@@ -31,6 +31,8 @@ Environment variables:
 | `MAX_CHANNELS_PER_IP` | `30` | Max channels per IP per minute |
 | `TRUST_PROXY` | `false` | Trust X-Forwarded-For / X-Real-IP headers (`true` or `1`) |
 | `DEBUG` | `false` | Enable debug logging for connections, pairing, relay (`true` or `1`) |
+| `BACKEND` | `memory` | Backend type: `memory` (single node) or `redis` (multi-node) |
+| `REDIS_URL` | `localhost:6379` | Redis address (only used when `BACKEND=redis`) |
 
 Pre-built binaries for Linux/macOS/Windows (amd64/arm64) are available on [GitHub Releases](https://github.com/xukaifu/latch-relay/releases).
 
