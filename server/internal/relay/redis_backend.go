@@ -215,6 +215,31 @@ func (r *RedisBackend) PopLocalPairing(pairingId string) *PairingInfo {
 	return &entry.info
 }
 
+const redisChannelPrefix = "latch:ch:"
+
+func (r *RedisBackend) RegisterChannelPeer(channelId, nodeId string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	key := redisChannelPrefix + channelId
+	// SETNX: returns true if we set it (first node), false if already exists (cross-node)
+	set, err := r.client.SetNX(ctx, key, nodeId, 30*time.Minute).Result()
+	if err != nil {
+		return false, err
+	}
+	if set {
+		return false, nil // we're the first node
+	}
+	// Another node already registered — cross-node channel
+	return true, nil
+}
+
+func (r *RedisBackend) UnregisterChannelPeer(channelId string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r.client.Del(ctx, redisChannelPrefix+channelId)
+}
+
 func (r *RedisBackend) NodeID() string { return r.nodeID }
 
 func (r *RedisBackend) Publish(channelId string, msg []byte) error {

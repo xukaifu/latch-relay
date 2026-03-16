@@ -39,11 +39,11 @@ func TestCrossNodePairing(t *testing.T) {
 
 	cfg.Backend = rb1
 	b1 := NewBridge(cfg)
-	t.Cleanup(b1.Close)
+	defer b1.Close()
 
 	cfg.Backend = rb2
 	b2 := NewBridge(cfg)
-	t.Cleanup(b2.Close)
+	defer b2.Close()
 
 	// Allow pub/sub subscriptions to establish
 	time.Sleep(200 * time.Millisecond)
@@ -53,7 +53,6 @@ func TestCrossNodePairing(t *testing.T) {
 	s2 := httptest.NewServer(http.HandlerFunc(HandleConnect(b2, cfg.IdleTimeout, cfg.MaxMessageSize, false)))
 	defer s2.Close()
 
-	// Connect client A to node 1
 	wsURL1 := "ws" + strings.TrimPrefix(s1.URL, "http")
 	wsA, _, err := websocket.Dial(context.Background(), wsURL1, nil)
 	if err != nil {
@@ -61,7 +60,6 @@ func TestCrossNodePairing(t *testing.T) {
 	}
 	defer wsA.Close(websocket.StatusNormalClosure, "")
 
-	// Connect client B to node 2
 	wsURL2 := "ws" + strings.TrimPrefix(s2.URL, "http")
 	wsB, _, err := websocket.Dial(context.Background(), wsURL2, nil)
 	if err != nil {
@@ -71,7 +69,6 @@ func TestCrossNodePairing(t *testing.T) {
 
 	pairingId := fmt.Sprintf("cross-test-%d-%d", time.Now().UnixNano(), time.Now().UnixMicro()%100000)
 
-	// Clean up any stale Redis key
 	ctx := context.Background()
 	rb1.client.Del(ctx, redisPairingPrefix+pairingId)
 
@@ -296,6 +293,205 @@ func TestCrossNodeMessageRelay(t *testing.T) {
 	if b.MessagesRelayed.Load() < 1 {
 		t.Fatalf("expected MessagesRelayed >= 1, got %d", b.MessagesRelayed.Load())
 	}
+}
+
+// TestCrossNodeE2E tests the full cross-node flow through two real Bridge instances
+// connected via Redis: pair → join → challenge → response → verify → relay → leave.
+// This is the definitive integration test for multi-node deployments.
+func TestCrossNodeE2E(t *testing.T) {
+	skipIfNoRedis(t)
+
+	rb1, err := NewRedisBackend("localhost:6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb2, err := NewRedisBackend("localhost:6379")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BridgeConfig{
+		MaxChannelsTotal: 100,
+		MaxMessageSize:   256 * 1024,
+		PairingTTL:       10 * time.Minute,
+		IdleTimeout:      60 * time.Second,
+		ChallengeTimeout: 10 * time.Second,
+		WaitPeerTimeout:  30 * time.Second,
+		Debug:            true,
+	}
+
+	cfg.Backend = rb1
+	b1 := NewBridge(cfg)
+	t.Cleanup(b1.Close)
+
+	cfg.Backend = rb2
+	b2 := NewBridge(cfg)
+	t.Cleanup(b2.Close)
+
+	time.Sleep(200 * time.Millisecond) // let pub/sub establish
+
+	s1 := httptest.NewServer(http.HandlerFunc(HandleConnect(b1, cfg.IdleTimeout, cfg.MaxMessageSize, false)))
+	defer s1.Close()
+	s2 := httptest.NewServer(http.HandlerFunc(HandleConnect(b2, cfg.IdleTimeout, cfg.MaxMessageSize, false)))
+	defer s2.Close()
+
+	wsURL1 := "ws" + strings.TrimPrefix(s1.URL, "http")
+	wsURL2 := "ws" + strings.TrimPrefix(s2.URL, "http")
+
+	wsA, _, err := websocket.Dial(context.Background(), wsURL1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wsA.Close(websocket.StatusNormalClosure, "")
+
+	wsB, _, err := websocket.Dial(context.Background(), wsURL2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wsB.Close(websocket.StatusNormalClosure, "")
+
+	// --- Phase 1: Pair across nodes ---
+	pairingId := fmt.Sprintf("e2e-cross-%d", time.Now().UnixNano())
+	rb1.client.Del(context.Background(), redisPairingPrefix+pairingId)
+
+	sendWS(t, wsA, InMsg{Type: "pair", Ch: pairingId, PubShare: b64.EncodeToString([]byte("pub-a")), ID: "alice"})
+	time.Sleep(100 * time.Millisecond)
+	sendWS(t, wsB, InMsg{Type: "pair", Ch: pairingId, PubShare: b64.EncodeToString([]byte("pub-b")), ID: "bob"})
+
+	matchA := recvWSTimeout(t, wsA, 5*time.Second)
+	matchB := recvWSTimeout(t, wsB, 5*time.Second)
+	if matchA.Type != "pair_matched" {
+		t.Fatalf("A: expected pair_matched, got %s code=%s", matchA.Type, matchA.Code)
+	}
+	if matchB.Type != "pair_matched" {
+		t.Fatalf("B: expected pair_matched, got %s code=%s", matchB.Type, matchB.Code)
+	}
+	t.Logf("Phase 1 PASS: paired across nodes A=%s B=%s", matchA.Role, matchB.Role)
+
+	// --- Phase 2: Both join the same channelId ---
+	// In real usage, channelId is derived from SPAKE2. Here we use a fixed one.
+	channelId := fmt.Sprintf("ch-e2e-%d", time.Now().UnixNano())
+
+	sendWS(t, wsA, InMsg{Type: "join", Ch: channelId, ID: "alice", Role: "initiator"})
+	chalA := recvWSTimeout(t, wsA, 5*time.Second)
+	if chalA.Type != "challenge" {
+		t.Fatalf("A: expected challenge, got %s code=%s", chalA.Type, chalA.Code)
+	}
+
+	// B joins on node 2 — triggers cross-node join_notify via Redis
+	sendWS(t, wsB, InMsg{Type: "join", Ch: channelId, ID: "bob", Role: "responder"})
+	chalB := recvWSTimeout(t, wsB, 5*time.Second)
+	if chalB.Type != "challenge" {
+		t.Fatalf("B: expected challenge, got %s code=%s", chalB.Type, chalB.Code)
+	}
+
+	// A may receive a re-challenge from the cross-node join
+	reChalA := recvWSTimeout(t, wsA, 3*time.Second)
+	if reChalA.Type == "challenge" {
+		chalA = reChalA // use the latest challenge nonce
+	}
+
+	t.Logf("Phase 2 PASS: both joined, challenges received")
+
+	// --- Phase 3: Both respond → verify_peer ---
+	// Respond to the latest challenges
+	sendWS(t, wsA, InMsg{Type: "response", Ch: channelId, Mac: b64.EncodeToString([]byte("mac-alice")), Role: "initiator"})
+	sendWS(t, wsB, InMsg{Type: "response", Ch: channelId, Mac: b64.EncodeToString([]byte("mac-bob")), Role: "responder"})
+
+	// Read messages until both get verify_peer (may have extra re-challenges in queue)
+	vpA := waitForType(t, wsA, "verify_peer", 5*time.Second)
+	vpB := waitForType(t, wsB, "verify_peer", 5*time.Second)
+
+	if vpA == nil {
+		t.Fatal("A: timed out waiting for verify_peer")
+	}
+	if vpB == nil {
+		t.Fatal("B: timed out waiting for verify_peer")
+	}
+	t.Logf("Phase 3 PASS: both verified, peerA=%s peerB=%s", vpA.PeerID, vpB.PeerID)
+
+	// --- Phase 4: Relay messages ---
+	// Small delay to let any residual challenge/verify messages settle
+	time.Sleep(200 * time.Millisecond)
+
+	sendWS(t, wsA, InMsg{Type: "message", Ch: channelId, Data: b64.EncodeToString([]byte("hello-from-A"))})
+	relayB := waitForType(t, wsB, "message", 5*time.Second)
+	if relayB == nil {
+		t.Fatal("B: timed out waiting for relayed message")
+	}
+	dataB, _ := b64.DecodeString(relayB.Data)
+	if string(dataB) != "hello-from-A" {
+		t.Fatalf("B: expected 'hello-from-A', got %q", string(dataB))
+	}
+
+	sendWS(t, wsB, InMsg{Type: "message", Ch: channelId, Data: b64.EncodeToString([]byte("hello-from-B"))})
+	relayA := waitForType(t, wsA, "message", 5*time.Second)
+	if relayA == nil {
+		t.Fatal("A: timed out waiting for relayed message")
+	}
+	dataA, _ := b64.DecodeString(relayA.Data)
+	if string(dataA) != "hello-from-B" {
+		t.Fatalf("A: expected 'hello-from-B', got %q", string(dataA))
+	}
+	t.Logf("Phase 4 PASS: bidirectional relay works")
+
+	// --- Phase 5: Leave ---
+	sendWS(t, wsA, InMsg{Type: "leave", Ch: channelId})
+	peerLeft := waitForType(t, wsB, "peer_left", 5*time.Second)
+	if peerLeft == nil {
+		t.Fatal("B: timed out waiting for peer_left")
+	}
+	if peerLeft.PeerID != "alice" {
+		t.Fatalf("B: expected peerId=alice, got %q", peerLeft.PeerID)
+	}
+	t.Logf("Phase 5 PASS: leave + peer_left across nodes")
+}
+
+// waitForType reads messages until one of the given type arrives, or times out.
+func waitForType(t *testing.T, ws *websocket.Conn, msgType string, timeout time.Duration) *OutMsg {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
+		_, data, err := ws.Read(ctx)
+		cancel()
+		if err != nil {
+			return nil
+		}
+		var msg OutMsg
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+		if msg.Type == msgType {
+			return &msg
+		}
+		// Re-challenges etc. — respond if needed
+		if msg.Type == "challenge" {
+			// Auto-respond to keep the flow going
+			resp := InMsg{Type: "response", Ch: msg.Ch, Mac: b64.EncodeToString([]byte("auto-mac"))}
+			d, _ := json.Marshal(resp)
+			wctx, wcancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ws.Write(wctx, websocket.MessageText, d)
+			wcancel()
+		}
+	}
+	return nil
+}
+
+func recvWSTimeout(t *testing.T, ws *websocket.Conn, timeout time.Duration) OutMsg {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, data, err := ws.Read(ctx)
+	if err != nil {
+		t.Fatalf("recvWSTimeout: %v", err)
+	}
+	var msg OutMsg
+	if err := json.Unmarshal(data, &msg); err != nil {
+		t.Fatal(err)
+	}
+	return msg
 }
 
 func sendWS(t *testing.T, ws *websocket.Conn, msg InMsg) {

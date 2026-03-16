@@ -416,6 +416,20 @@ func (b *Bridge) handleJoin(conn *Connection, msg InMsg) {
 		gen := ch.WaitGen
 		sendMsg(conn, OutMsg{Type: "challenge", Ch: msg.Ch, Nonce: b64.EncodeToString(nonce)})
 		go b.waitPeerTimeout(msg.Ch, gen)
+
+		// Register with backend for cross-node discovery
+		if crossNode, _ := b.backend.RegisterChannelPeer(msg.Ch, b.backend.NodeID()); crossNode {
+			// Another node already has a peer — notify it
+			data, err := marshalRemoteMsg("join_notify", msg.Ch, b.backend.NodeID(), RemoteJoinNotify{
+				PeerID: msg.ID,
+				Nonce:  nonce,
+			})
+			if err == nil {
+				if pubErr := b.backend.Publish(msg.Ch, data); pubErr != nil {
+					log.Printf("publish join_notify: %v", pubErr)
+				}
+			}
+		}
 	} else {
 		// Second peer: re-challenge BOTH with fresh nonces
 		ch.State = StateChallenging
@@ -1018,6 +1032,19 @@ func (b *Bridge) handleRemoteJoinNotify(channelId string, jn RemoteJoinNotify) {
 			ch.Peers[i].Nonce = freshNonce
 			ch.Peers[i].Response = nil
 			sendMsg(peer.Conn, OutMsg{Type: "challenge", Ch: channelId, Nonce: b64.EncodeToString(freshNonce)})
+
+			// If this isn't already a reply, notify the other node about
+			// our local peer so it can create a stub too.
+			if !jn.Reply {
+				data, err := marshalRemoteMsg("join_notify", channelId, b.backend.NodeID(), RemoteJoinNotify{
+					PeerID: peer.ID,
+					Nonce:  freshNonce,
+					Reply:  true,
+				})
+				if err == nil {
+					b.backend.Publish(channelId, data)
+				}
+			}
 		}
 	}
 }

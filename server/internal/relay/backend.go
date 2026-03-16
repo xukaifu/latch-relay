@@ -46,6 +46,13 @@ type Backend interface {
 	// Used when a remote node notifies us of a cross-node match.
 	PopLocalPairing(pairingId string) *PairingInfo
 
+	// RegisterChannelPeer registers that this node has a peer in a channel.
+	// Returns true if another node already has a peer (cross-node channel).
+	RegisterChannelPeer(channelId, nodeId string) (bool, error)
+
+	// UnregisterChannelPeer removes channel registration for this node.
+	UnregisterChannelPeer(channelId string)
+
 	// Publish sends a message to other nodes for a channel.
 	// No-op for single-node backends.
 	Publish(channelId string, msg []byte) error

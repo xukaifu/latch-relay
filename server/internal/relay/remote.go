@@ -22,6 +22,7 @@ type RemotePairMatched struct {
 type RemoteJoinNotify struct {
 	PeerID string `json:"peerId"`
 	Nonce  []byte `json:"nonce"`
+	Reply  bool   `json:"reply,omitempty"` // true = this is a reply, don't reply again
 }
 
 // RemoteResponse forwards a challenge response from a remote peer.
