@@ -2,8 +2,9 @@ package relay
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
-	"log"
+	"fmt"
 	"sync"
 	"time"
 
@@ -45,8 +46,10 @@ func NewRedisBackend(redisURL string) (*RedisBackend, error) {
 		return nil, err
 	}
 
-	// Use hostname as nodeID
-	nodeID := "node-" + time.Now().Format("20060102150405")
+	// Generate unique nodeID
+	idBytes := make([]byte, 8)
+	rand.Read(idBytes)
+	nodeID := fmt.Sprintf("node-%x", idBytes)
 
 	rb := &RedisBackend{
 		client: client,
@@ -94,11 +97,14 @@ func (r *RedisBackend) StorePairing(pairingId string, peer PairingInfo) (*Pairin
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// Check if another node already stored a peer for this pairingId
-	existing_data, err := r.client.GetSet(ctx, redisPairingPrefix+pairingId, data).Result()
+	// Atomically set our data and get the previous value (SET key value GET EX)
+	key := redisPairingPrefix + pairingId
+	existingData, err := r.client.SetArgs(ctx, key, data, redis.SetArgs{
+		TTL: 10 * time.Minute,
+		Get: true,
+	}).Result()
 	if err == redis.Nil {
-		// No existing entry — we're the first peer, set TTL
-		r.client.Expire(ctx, redisPairingPrefix+pairingId, 10*time.Minute)
+		// No existing entry — we're the first peer
 		return nil, nil
 	}
 	if err != nil {
@@ -107,12 +113,12 @@ func (r *RedisBackend) StorePairing(pairingId string, peer PairingInfo) (*Pairin
 
 	// Another node had a waiting peer — match across nodes
 	var remoteData redisPairingData
-	if err := json.Unmarshal([]byte(existing_data), &remoteData); err != nil {
+	if err := json.Unmarshal([]byte(existingData), &remoteData); err != nil {
 		return nil, err
 	}
 
 	// Clean up
-	r.client.Del(ctx, redisPairingPrefix+pairingId)
+	r.client.Del(ctx, key)
 	r.mu.Lock()
 	delete(r.local, pairingId)
 	r.mu.Unlock()
@@ -198,6 +204,17 @@ func (r *RedisBackend) PairingCount() int {
 	return len(r.local)
 }
 
+func (r *RedisBackend) PopLocalPairing(pairingId string) *PairingInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.local[pairingId]
+	if !ok {
+		return nil
+	}
+	delete(r.local, pairingId)
+	return &entry.info
+}
+
 func (r *RedisBackend) Publish(channelId string, msg []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -233,7 +250,5 @@ func (r *RedisBackend) Close() {
 	default:
 		close(r.stop)
 	}
-	if err := r.client.Close(); err != nil {
-		log.Printf("redis close: %v", err)
-	}
+	r.client.Close()
 }

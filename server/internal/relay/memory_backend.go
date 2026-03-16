@@ -89,6 +89,17 @@ func (m *MemoryBackend) PairingCount() int {
 	return len(m.waitingPeers)
 }
 
+func (m *MemoryBackend) PopLocalPairing(pairingId string) *PairingInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.waitingPeers[pairingId]
+	if !ok {
+		return nil
+	}
+	delete(m.waitingPeers, pairingId)
+	return &entry.info
+}
+
 // Publish is a no-op for single-node memory backend.
 func (m *MemoryBackend) Publish(channelId string, msg []byte) error { return nil }
 

@@ -42,6 +42,10 @@ type Backend interface {
 	// PairingCount returns the number of waiting peers.
 	PairingCount() int
 
+	// PopLocalPairing removes and returns a local waiting peer by pairingId.
+	// Used when a remote node notifies us of a cross-node match.
+	PopLocalPairing(pairingId string) *PairingInfo
+
 	// Publish sends a message to other nodes for a channel.
 	// No-op for single-node backends.
 	Publish(channelId string, msg []byte) error

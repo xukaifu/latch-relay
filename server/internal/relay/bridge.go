@@ -896,24 +896,14 @@ func (b *Bridge) handleRemoteMsg(channelId string, msg []byte) {
 // handleRemotePairMatched delivers pair_matched to a local waiting peer
 // when the match was made on another node.
 func (b *Bridge) handleRemotePairMatched(pairingId string, pm RemotePairMatched) {
-	// The local peer was the initiator (first to store).
-	// Find its connection from the backend's local cache.
-	b.backend.(*RedisBackend).mu.Lock()
-	entry, ok := b.backend.(*RedisBackend).local[pairingId]
-	var conn *Connection
-	if ok {
-		conn = entry.info.Conn
-		delete(b.backend.(*RedisBackend).local, pairingId)
-	}
-	b.backend.(*RedisBackend).mu.Unlock()
-
-	if conn == nil {
+	info := b.backend.PopLocalPairing(pairingId)
+	if info == nil || info.Conn == nil {
 		return
 	}
 
-	b.debugf("remote pair_matched ch=%s local_peer=%s remote_peer=%s", pairingId[:min(16, len(pairingId))], entry.info.ID, pm.PeerID)
+	b.debugf("remote pair_matched ch=%s local_peer=%s remote_peer=%s", pairingId[:min(16, len(pairingId))], info.ID, pm.PeerID)
 
-	sendMsg(conn, OutMsg{
+	sendMsg(info.Conn, OutMsg{
 		Type:     "pair_matched",
 		Ch:       pairingId,
 		PubShare: b64.EncodeToString(pm.PeerPubShare),
