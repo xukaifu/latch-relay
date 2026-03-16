@@ -52,6 +52,11 @@ public class LatchClient {
     public var onPeerLeft: ((String, String) -> Void)?
     public var onError: ((String, String) -> Void)?
 
+    /// Whether the WebSocket connection is alive and running.
+    public var isConnected: Bool {
+        webSocket?.state == .running
+    }
+
     private var webSocket: URLSessionWebSocketTask?
     private let session: URLSession
     private let encoder = JSONEncoder()
