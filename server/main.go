@@ -15,6 +15,21 @@ import (
 
 func main() {
 	cfg := LoadConfig()
+
+	var backend relay.Backend
+	switch cfg.Backend {
+	case "redis":
+		rb, err := relay.NewRedisBackend(cfg.RedisURL)
+		if err != nil {
+			log.Fatalf("redis backend: %v", err)
+		}
+		backend = rb
+		log.Printf("using redis backend: %s", cfg.RedisURL)
+	default:
+		backend = relay.NewMemoryBackend()
+		log.Println("using memory backend")
+	}
+
 	b := relay.NewBridge(relay.BridgeConfig{
 		MaxChannelsTotal: cfg.MaxChannelsTotal,
 		MaxMessageSize:   cfg.MaxMessageSize,
@@ -25,6 +40,7 @@ func main() {
 		MaxPairingsPerIP: cfg.MaxPairingsPerIP,
 		MaxChannelsPerIP: cfg.MaxChannelsPerIP,
 		Debug:            cfg.Debug,
+		Backend:          backend,
 	})
 
 	mux := http.NewServeMux()

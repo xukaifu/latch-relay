@@ -18,6 +18,8 @@ type Config struct {
 	MaxChannelsPerIP int
 	TrustProxy       bool
 	Debug            bool
+	Backend          string // "memory" (default) or "redis"
+	RedisURL         string // Redis address (default "localhost:6379")
 }
 
 func LoadConfig() Config {
@@ -47,6 +49,14 @@ func LoadConfig() Config {
 	}
 	if os.Getenv("DEBUG") == "true" || os.Getenv("DEBUG") == "1" {
 		c.Debug = true
+	}
+	if b := os.Getenv("BACKEND"); b != "" {
+		c.Backend = b
+	}
+	if u := os.Getenv("REDIS_URL"); u != "" {
+		c.RedisURL = u
+	} else {
+		c.RedisURL = "localhost:6379"
 	}
 	return c
 }
